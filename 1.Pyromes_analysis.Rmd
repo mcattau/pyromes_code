@@ -1,0 +1,1627 @@
+---
+title: "Analysis and Figures for Modern pyromes: Biogeographical patterns of fire characteristics across the contiguous United States"
+author: Megan E. Cattau, Adam Mahood, Jennifer K. Balch, and Carol Wessman
+date: "`r Sys.Date()`"
+output:
+  pdf_document: 
+    toc: false
+    toc_depth: 2
+    number_sections: false
+    keep_tex: yes
+    extra_dependencies: "subfig"
+latex_engine: pdflatex
+header-includes:
+  \usepackage{helvet}
+  \renewcommand\familydefault{\sfdefault}
+  \usepackage{placeins}
+  \usepackage{caption}
+  \captionsetup[figure]{labelformat=empty}
+  \captionsetup[table]{labelformat=empty}
+  \pagenumbering{gobble} % Suppress page number on the title page
+---
+  
+# setwd("/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data")
+
+```{r, setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+knitr::opts_knit$set(root.dir = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data"),
+knitr::knit_hooks$set(plot = function(x, options)  {
+  paste0(knitr::hook_plot_tex(x, options), "\n\\FloatBarrier\n")
+})
+  )
+```
+
+```{r knitr-NA}
+# Displays blank instead of NA for missing values
+options(knitr.kable.NA = '') 
+```
+
+```{r load-packages, results="hide"}
+library(rgdal)
+library(sp)
+library(sf)
+library(dplyr)
+library(raster)
+library(sendmailR)
+library(tidyr)
+library(lubridate)
+library(rgeos)
+library(ggplot2)
+library(assertthat)
+library(plyr)
+
+library(factoextra)
+library(dendextend)
+library(ggdendro)
+library(pvclust)
+library(clValid)
+library(mclust)
+
+library(ggthemes)
+library(ggmap)
+library(RColorBrewer)
+library(ggpubr)
+library(knitr)
+library(gtsummary)
+library(kableExtra)
+```
+
+
+```{r import data, cache=TRUE, results="hide"}
+# Projection for layers
+#EPSG:32613
+data_crs<- " +proj=utm +zone=13 +datum=WGS84 +units=m +no_defs +ellps=WGS84 "
+
+
+### US States
+States <- st_read(dsn = 'States', layer = "cb_2016_us_state_20m", quiet = TRUE) %>%
+filter(!(NAME %in% c("Alaska", "Hawaii", "Puerto Rico"))) %>%
+dplyr::select(STATEFP, STUSPS) %>%
+setNames(tolower(names(.))) %>% 
+st_transform(., data_crs)
+
+
+# Create a raster that's extent of States and 50km resolution and write into Data folder
+Fishnet<- raster(ext=extent(States), resolution=50000)		
+projection(Fishnet)<-crs(data_crs)	
+writeRaster(Fishnet,"Fishnet.grd", format="raster", overwrite=TRUE)
+
+
+### MTBS fire perimeters, 1984-2020
+MTBS2 <- st_read(dsn = 'MTBS', layer = "mtbs_perims_DD", quiet = TRUE) %>%
+st_transform(., data_crs)
+
+MTBS<-as(MTBS2, 'Spatial')
+
+#MTBS preprocessing
+# names(MTBS)
+MTBS$JD<-yday(MTBS$Ig_Date)										# add JD col
+MTBS$FireYear<-year(MTBS$Ig_Date)												# add year column
+MTBS$FireID<-1:nrow(MTBS)		
+MTBS$ha<-MTBS$BurnBndAc*0.4046856
+
+# convert to points
+MTBS_point1<-gCentroid(MTBS, byid=TRUE, id=MTBS$FireID)
+MTBS_point<-SpatialPointsDataFrame(MTBS_point1, MTBS@data)
+
+
+## MODIS active fire data
+MODIS2 <- st_read(dsn = 'MODIS', layer = "fire_archive_M-C61_275705", quiet = TRUE) %>%
+st_transform(., data_crs)
+#limit to 2020 because dec of 2021 still nrt rather than archive data
+class(MODIS2$ACQ_DATE)
+MODIS3 <-MODIS2[year(MODIS2$ACQ_DATE)<=2020,]
+MODIS<-as(MODIS3, 'Spatial')
+
+# MODIS preprocessing
+# names(MODIS)
+MODIS$JD<-yday(MODIS$ACQ_DATE)																	# add JD col
+MODIS$FireYear<-year(MODIS$ACQ_DATE)															# add year column
+MODIS$FireID<-1:nrow(MODIS)		
+
+### FPA-FOD
+FOD2 <- st_read("FOD/Data/FPA_FOD_20210617.gdb", layer = "Fires") %>%
+  st_transform(., data_crs)
+FOD<-as(FOD2, 'Spatial')
+
+# FOD preprocessing
+# names(FOD)
+FOD$ha <- FOD$FIRE_SIZE*0.4046856    #size in hectares
+FOD <- subset(FOD, is.na(FOD$NWCG_CAUSE_CLASSIFICATION) == FALSE) #cleaning up one NA
+
+# explore percent each ignition type
+data.frame((table(FOD$NWCG_CAUSE_CLASSIFICATION))/nrow(FOD)*100)
+# area by ignition type
+#aggregate(FOD$ha, by=list(Category=FOD$NWCG_CAUSE_CLASSIFICATION), FUN=sum)
+
+####
+FOD$JD<-FOD$DISCOVERY_DOY																			# add JD col, ddoy = discovery date
+FOD$FireYear<-FOD$FIRE_YEAR																		# add year column
+
+# Just human ones
+FOD_human<-FOD[FOD$NWCG_CAUSE_CLASSIFICATION=="Human",]
+
+### EPA Level I Ecoregions 
+# clipped to States in QGIS
+Ecoregion_clip <- st_read(dsn = 'Ecoregion', layer = "ecoregion_proj_fix_clip", quiet = TRUE) %>%
+  st_transform(., data_crs)
+Ecoregion_fix<-st_make_valid(Ecoregion_clip)
+Ecoregion<-as(Ecoregion_fix, 'Spatial')
+Ecoregion_simple<-st_simplify(Ecoregion_fix)
+Ecoregion2<-as(Ecoregion_simple, 'Spatial')
+```
+
+
+```{r list of rasters, cache=TRUE, results="hide"}
+# parse all the fire layers by year into a list of vector objects, calling them "xxxxx_parsed", each vector in the list called xxxx_yyyy
+parse_vector <- function(all_data, prefix, year_seq) {
+	# The function takes a vector layer (arg: all_data; e.g., MTBS), parses it by year, gives each new object a sensible name with a defined prefix (arg: prefix; e.g., fire), 	
+	# returns a list of vector objects
+	# args= all_data (the original polygon / points data), prefix (prefix for the name of the parsed vector layers), year_seq (sequence of relevant years)
+
+	# A nested function - parse the data based on Year
+	separate_data_by_year<-function(year){
+		all_data[all_data$FireYear==year,]
+	}
+	
+	# Apply this function over the range of relevant years, resulting in a list of vector objects for each year
+	vector_list <- lapply(year_seq, separate_data_by_year)
+	# Name each object in the list prefix_year
+	names(vector_list) <- paste(prefix, year_seq, sep = "_")
+	
+	vector_list
+}
+
+# range(MTBS$FireYear) #1984-2020
+MTBS_parsed<-parse_vector(MTBS_point, "MTBS", (min(MTBS$FireYear):max(MTBS$FireYear)))
+
+# range(MODIS$FireYear) # 2003 - 2020
+MODIS_parsed<-parse_vector(MODIS, "MODIS", (min(MODIS$FireYear):max(MODIS$FireYear)))
+
+# range(FOD$FireYear) # 1992 - 2018
+FOD_parsed<-parse_vector(FOD, "FOD", (min(FOD$FireYear):max(FOD$FireYear)))
+FOD_human_parsed<-parse_vector(FOD_human, "FOD_human", (min(FOD_human$FireYear):max(FOD_human$FireYear)))
+```
+
+```{r generate variables, cache=TRUE, results="hide"}
+
+######### convert the a list of vector objects into the relevant rasters
+# Generate annual rasters of:
+# Number of fires - count of MODIS FRP points, MTBS, FOD				
+## 1.		Number_fires_MODIS
+## 2.		Number_fires_MTBS
+## 3.		Number_fires_FOD
+
+# Max, mean, std FRP, MODIS																				
+## 4. 	Mean_FRP_MODIS
+## 5.	 	Max_FRP_MODIS
+
+# Mean, max fire event size MTBS, FOD											
+## 6. 	Mean_area_MTBS
+## 7.	 	Max_area_MTBS
+## 8. 	Mean_area_FOD
+## 9.		Max_area_FOD
+
+# Burned area MTBS, FOD	
+## 10.	Sum_area_MTBS
+## 11.	Sum_area_FOD
+
+# Season Length (std * 2 JD), MODIS, MTBS, FOD									
+## 12.	Std_JD_MTBS
+## 13.	Std_JD_MODIS
+## 14.	Std_JD_SFOD
+
+# Ignition type (Perc human ignitions) FOD
+## 15. 	Perc human ignitions FOD
+
+annual_rasters <- function(vector_data, template, prefix, year_seq, field, fun, background) {
+	# The function takes a list of vector objects, creates annual rasters based on a particular variable, and gives each new raster a sensible name with a defined prefix (arg: prefix; e.g., fire), 		# args= vector_data (a list of vector objects), template (a raster whose extent / res will be used for the putput rasters), prefix (prefix for the name of the raster layers), year_seq (sequence of relevant years), field= field on which to based calculations (e.g., FRP), fun = function to apply on that field (e.g., max), background(what value to give raster if there are no vector elements in there)
+		# returns a list of rasters
+	
+	# A nested function - rasterize a polygon
+		raster_each_year<- function(polygon){
+		# Set the resolution and extent based on a template raster
+		r <- raster(ncol=ncol(template), nrow=nrow(template))
+		extent(r)<-extent(template)
+		projection(r)<-projection(template)
+		
+		if (length(polygon)==0)
+			new_raster<-setValues(r, 0) 
+		else
+			new_raster<-rasterize(polygon, r, field=field, fun=fun, background=background)
+			# new_raster[is.na(new_raster)]<-0 - remove this because we do want some to be NA
+		new_raster
+	}
+
+	annual_rasters<-lapply(vector_data, raster_each_year)
+	names(annual_rasters) <- paste(prefix, year_seq, sep = "_")
+	
+	annual_rasters
+}
+
+# args: (vector_data, template, prefix, year_seq, field, fun, background)
+# Fire frequency
+Number_fires_MODIS<-annual_rasters(MODIS_parsed, Fishnet, "MODIS_Numfires", 2003:2020, "FireID", fun="count", background=0) # for count, it doesn't matter what field you use if points
+Number_fires_MTBS<-annual_rasters(MTBS_parsed, Fishnet, "MTBS_Numfires", 1984:2020, "FireID", fun="count", background=0) 
+Number_fires_FOD<-annual_rasters(FOD_parsed, Fishnet, "FOD_Numfires", 1992:2018, "FOD_ID", fun="count", background=0)
+
+# Fire intensity - give background of NA so that not included in means if no fire in them
+Mean_FRP_MODIS<-annual_rasters(MODIS_parsed, Fishnet, "MODIS_meanFRP", 2003:2020, "FRP", fun=mean, background=NA)
+Max_FRP_MODIS<-annual_rasters(MODIS_parsed, Fishnet, "MODIS_maxFRP", 2003:2020, "FRP", fun=max,  background=NA)
+
+# Fire event size
+Mean_area_MTBS<-annual_rasters(MTBS_parsed, Fishnet, "MTBS_meanArea", 1984:2020, "ha", fun=mean, background=NA) 
+Max_area_MTBS<-annual_rasters(MTBS_parsed, Fishnet, "MTBS_maxArea", 1984:2020, field="ha", fun=max,  background=NA) 
+Mean_area_FOD<-annual_rasters(FOD_parsed, Fishnet, "FOD_meanArea", 1992:2018, "ha", fun=mean, background=NA) 
+Max_area_FOD<-annual_rasters(FOD_parsed, Fishnet, "FOD_maxArea", 1992:2018, "ha", fun=max, background=NA) 
+
+# Burned area
+Sum_area_MTBS<-annual_rasters(MTBS_parsed, Fishnet, "MTBS_sumArea", 1984:2020, "ha", fun=sum, background=NA) 
+Sum_area_FOD<-annual_rasters(FOD_parsed, Fishnet, "FOD_sumArea", 1992:2018, "ha", fun=sum, background=NA) 
+
+# Fire seasonality
+Std_JD_MTBS<-annual_rasters(MTBS_parsed, Fishnet, "MTBS_stdJD", 1984:2020, "JD", fun=sd, background=NA)
+Std_JD_MODIS<-annual_rasters(MODIS_parsed, Fishnet, "MODIS_stdJD", 2003:2020, "JD", fun=sd, background=NA) 
+Std_JD_FOD<-annual_rasters(FOD_parsed, Fishnet, "FOD_stdJD", 1992:2018, "JD", fun=sd, background=NA) 
+# Make it Std JD * 2
+Std2_JD_MTBS<-calc(stack(Std_JD_MTBS), function(x) x*2, forceapply=TRUE)
+Std2_JD_MODIS<-calc(stack(Std_JD_MODIS), function(x) x*2, forceapply=TRUE)
+Std2_JD_FOD<-calc(stack(Std_JD_FOD), function(x) x*2, forceapply=TRUE)
+
+# Perc human ignitions
+Number_fires_FOD2<-annual_rasters(FOD_parsed, Fishnet, "FOD_Numfires", 1992:2018, "FireYear", fun="count", background=NA) # background is NA instead of 0 so that if there were no fires in that cell, the perc human ign value won't be calculated
+Number_fires_FOD_human<-annual_rasters(FOD_human_parsed, Fishnet, "FOD_Number_fires_human", 1992:2018, "FireYear", fun="count", background=0) #Background = 0 so that if there were fires in that cell but no human fires, the value is still calculated
+Perc_fires_FOD_human<-stack(Number_fires_FOD_human) / stack(Number_fires_FOD2)
+
+results_rasterstack<-stack(stack(Number_fires_MODIS), stack(Number_fires_MTBS), stack(Number_fires_FOD), stack(Mean_FRP_MODIS), stack(Max_FRP_MODIS), stack(Mean_area_MTBS), stack(Max_area_MTBS), stack(Mean_area_FOD), stack(Max_area_FOD), stack(Sum_area_MTBS), stack(Sum_area_FOD), stack(Std2_JD_MODIS),stack(Std2_JD_MTBS), stack(Std2_JD_FOD), stack(Perc_fires_FOD_human))
+# names(results_rasterstack)
+# writeRaster(results_rasterstack,"Results/results_rasterstack.grd", format="raster", overwrite=TRUE)
+# results_rasterstack<-stack("results_rasterstack.grd")							# Import sampled rasters - annual
+
+# stats on each variable across all years rather than annual
+Number_fires_MODIS_mean<-calc(stack(Number_fires_MODIS), mean)
+Number_fires_MTBS_mean<-calc(stack(Number_fires_MTBS), mean)
+Number_fires_FOD_mean<-calc(stack(Number_fires_FOD), mean)
+
+Mean_FRP_MODIS_mean<-calc(stack(Mean_FRP_MODIS), mean, na.rm=TRUE)
+Max_FRP_MODIS_mean<-calc(stack(Max_FRP_MODIS), mean, na.rm=TRUE)
+
+Mean_area_MTBS_mean<-calc(stack(Mean_area_MTBS), mean, na.rm=TRUE)
+Max_area_MTBS_mean<-calc(stack(Max_area_MTBS), mean, na.rm=TRUE)
+Mean_area_FOD_mean<-calc(stack(Mean_area_FOD), mean, na.rm=TRUE)
+Max_area_FOD_mean<-calc(stack(Max_area_FOD), mean, na.rm=TRUE)
+
+Sum_area_MTBS_mean<-calc(stack(Sum_area_MTBS), mean, na.rm=TRUE)
+Sum_area_FOD_mean<-calc(stack(Sum_area_FOD), mean, na.rm=TRUE)
+
+# (2 * SD for season length already calculated above)
+Std2_JD_MODIS_mean<-calc(stack(Std2_JD_MODIS), mean, na.rm=TRUE)
+Std2_JD_MTBS_mean<-calc(stack(Std2_JD_MTBS), mean, na.rm=TRUE)
+Std2_JD_FOD_mean<-calc(stack(Std2_JD_FOD), mean, na.rm=TRUE)
+
+Perc_fires_FOD_human_mean<-calc(stack(Perc_fires_FOD_human), mean, na.rm=TRUE)
+
+
+results_rasterstack_mean<-stack(Number_fires_MODIS_mean, Number_fires_MTBS_mean, Number_fires_FOD_mean, Mean_FRP_MODIS_mean, Max_FRP_MODIS_mean, Mean_area_MTBS_mean, Max_area_MTBS_mean, Mean_area_FOD_mean, Max_area_FOD_mean,  Sum_area_MTBS_mean, Sum_area_FOD_mean, Std2_JD_MODIS_mean, Std2_JD_MTBS_mean, Std2_JD_FOD_mean, Perc_fires_FOD_human_mean)
+
+# writeRaster(results_rasterstack_mean,"Results/results_rasterstack_mean.grd", format="raster", overwrite=TRUE)
+# results_rasterstack_mean<-stack("Results/results_rasterstack_mean.grd")							# Import sampled rasters - annual
+```
+
+```{r sample, cache=TRUE, results="hide"}
+
+# Get data into shape
+
+# if need to reimport:
+# results_rasterstack<-stack("results_rasterstack.grd")							# Import sampled rasters - annual
+# results_rasterstack_mean<-stack("results_rasterstack_mean.grd") # Import sampled rasters - mean
+# States<-readOGR("States","CONUS") 															# Import States layer
+
+results_rasterstack_all<-stack(results_rasterstack_mean, results_rasterstack)			# Combine annual and mean sampled pyromes rasters
+results_rasterstack_mask<-mask(results_rasterstack_all, States)									# mask combined sampled pyromes rasters
+
+sample_points<-rasterToPoints(results_rasterstack_mask[[1]], spatial=TRUE)			# create sample point locations from one of the rasters
+samples<-raster::extract(results_rasterstack_mask, sample_points, sp=TRUE)			# extract values at sample points
+# names(samples)
+samples<-samples[-1]																											# remove repeat layer
+
+# format for the annual layers is datasource_measuredthing_yyyy
+# format for the mean layers is layer.x, so rewrite that below
+names(samples)<-c("Number_fires_MODIS_mean", "Number_fires_MTBS_mean", "Number_fires_FOD_mean", "Mean_FRP_MODIS_mean", "Max_FRP_MODIS_mean", "Mean_area_MTBS_mean", "Max_area_MTBS_mean", "Mean_area_FOD_mean", "Max_area_FOD_mean", "Sum_area_MTBS_mean", "Sum_area_FOD_mean", "Std_JD_MODIS_mean", "Std_JD_MTBS_mean",  "Std_JD_FOD_mean", "Perc_human_FOD_mean", names(results_rasterstack))
+
+samples_p <- SpatialPointsDataFrame(samples, data=samples@data, proj4string=crs(MODIS))		# project 
+samples_p$FID<-1:nrow(samples_p)																										# put FID in there
+
+
+samples_df<-data.frame(samples_p)
+samples_df<-samples_df[,-438]																				# remove 'optional' column
+
+
+eco_data<-sp::over(samples_p, Ecoregion[,"NA_L1NAME"], fn=NULL)
+samples_df$ecoregion<-eco_data$NA_L1NAME
+samples_p$ecoregion<-eco_data
+
+samples_spatial<-samples_df
+coordinates(samples_spatial)<-~x+y
+proj4string(samples_spatial)<-CRS("+init=epsg:32613")
+# all the mean values plus FID and ecoregion
+# samples_df_mean<-samples_df[,c(1:15, 376, 379)]
+samples_spatial_mean<-samples_spatial[,c(1:15, 435, 436)]
+
+### Write and retrieve samples_df dataframe
+write.csv(samples_df, "Results/samples_df.csv")
+# samples_df<-read.csv("samples_df.csv")
+# names(samples_df)
+# samples_df<-samples_df[,-1]	
+```
+
+```{r samples_process, cache=TRUE, results="hide"}
+
+# Import data - if needed from previous
+# Fire variables sampled at 50km resolution
+# samples_df<-read.csv("samples_df.csv")
+# names(samples_df)
+# samples_df<-samples_df[,-1]		
+
+#make NA values 0 for PCA and clustering
+samples_df[is.na(samples_df)]<-0
+
+# Prepare the data - just get mean values, x, and y
+samples_df_mean_no_anth<-samples_df[,c(1:14, 436, 437)]							
+# Prepare the data - just get mean values, x, and y wo location data
+# names(samples_df_mean_no_anth)
+samples_df_mean_no_anth_no_xy<-samples_df_mean_no_anth[,c(-15:-16)]															
+
+# standardize variables (w location data)
+samples_df_mean_no_anth_sc<-as.data.frame(scale(samples_df_mean_no_anth))													
+
+# Names to pass later to functions
+names_vector<-c("Num fires (MODIS)", "Num fires (MTBS)", "Num fires (FPA FOD)", "Mean Intensity (MODIS)", "Max Intensity (MODIS)", "Mean Fire Size (MTBS)", "Max Fire Size (MTBS)",  "Mean Fire Size (FPA FOD)", "Max Fire Size (FPA FOD)",  "Burned Area (MTBS)",  "Burned Area (FPA FOD)", "Season Length (MODIS)",  "Season Length (MTBS)",  "Season Length (FPA FOD)", "Prop human ign (FPA FOD)")
+
+names_simple<-c("Fire Frequency (n fires)", "Fire Frequency (n fires)", "Fire Frequency (n fires)", "Average Intensity (MW)", "Extreme Intensity(MW)", "Average Fire Size (ha)", "Extreme Fire Size (ha)", "Average Fire Size (ha)", "Extreme Fire Size (ha)", "Burned area (ha)", "Burned area (ha)", "Season Length (days)","Season Length (days)", "Season Length (days)", "Human Ignitions (Proportion)")
+
+names_no_units<-c("Fire Frequency", "Fire Frequency", "Fire Frequency", "Average Intensity", "Extreme Intensity", "Average Fire Size", "Extreme Fire Size", "Average Fire Size", "Extreme Fire Size", "Burned area", "Burned area", "Season Length","Season Length", "Season Length", "Human Ignitions")
+
+units_simple<-c("n fires", "n fires", "n fires", "MW", "MW", "ha", "ha", "ha","ha", "ha", "ha", "days","days", "days", "proportion")
+
+names(samples_df_mean_no_anth_no_xy)<-names_vector[1:14]
+```
+
+```{r variables_redundancy, cache=TRUE, results="hide"}
+
+# Number of fires - MODIS, FOD, MTBS
+num_fires_long<-gather(samples_df[,c(1:3, 435)], key=variable, value=value, -FID)
+num_fires_long$group<-ifelse(substr(num_fires_long$variable, 14, 18)=="MODIS", "MODIS", ifelse(substr(num_fires_long$variable, 14, 17)=="MTBS", "MTBS", ifelse(substr(num_fires_long$variable, 14, 16)=="FOD", "FPA-FOD",-9999)))
+num_fires_long$group<-as.factor(num_fires_long$group)
+
+kruskal.test(value ~ group, data = num_fires_long)
+# P < 0.001
+# Pairwise comparisons using Wilcoxon rank sum test 
+pairwise.wilcox.test(num_fires_long$value, 
+                     num_fires_long$group, 
+                     p.adjust.method="none")
+# All p < 0.001
+
+# Max Mean and Sum area - MTBS and FOD
+## Mean Area
+mean_area_long<-gather(samples_df[,c(6, 8, 435)], key=variable, value=value, -FID)
+mean_area_long$group<-ifelse(substr(mean_area_long$variable, 11, 14)=="MTBS", "MTBS", ifelse(substr(mean_area_long$variable, 11, 15)=="FOD", "FPA-FOD",-9999))
+mean_area_long$group<-as.factor(mean_area_long$group)
+unique(mean_area_long$group)
+wilcox.test(mean_area_long$value~mean_area_long$group)
+# P < 0.001
+
+## Max Area
+max_area_long<-gather(samples_df[,c(7, 9, 435)], key=variable, value=value, -FID)
+max_area_long$group<-ifelse(substr(max_area_long$variable, 10, 13)=="MTBS", "MTBS", ifelse(substr(max_area_long$variable, 10, 12)=="FOD", "FPA-FOD",-9999))
+max_area_long$group<-as.factor(max_area_long$group)
+unique(max_area_long$group)
+wilcox.test(max_area_long$value~max_area_long$group)
+# P < 0.001
+
+## Sum Area
+sum_area_long<-gather(samples_df[,c(10, 11, 435)], key=variable, value=value, -FID)
+sum_area_long$group<-ifelse(substr(sum_area_long$variable, 10, 13)=="MTBS", "MTBS", ifelse(substr(sum_area_long$variable, 10, 12)=="FOD", "FPA-FOD",-9999))
+sum_area_long$group<-as.factor(sum_area_long$group)
+unique(sum_area_long$group)
+wilcox.test(sum_area_long$value~sum_area_long$group)
+# P < 0.001
+
+# Seasonality - MTBS, MODIS, and FOD
+season_long<-gather(samples_df[,c(12, 13, 14, 435)], key=variable, value=value, -FID)
+season_long$group<-ifelse(substr(season_long$variable, 8, 12)=="MODIS", "MODIS", ifelse(substr(season_long$variable, 8, 11)=="MTBS", "MTBS", ifelse(substr(season_long$variable, 8, 10)=="FOD", "FPA-FOD",-9999)))
+season_long$group<-as.factor(season_long$group)
+unique(season_long$group)
+kruskal.test(value ~ group, data = season_long)
+# P < 0.001
+# Pairwise comparisons using Wilcoxon rank sum test 
+pairwise.wilcox.test(season_long$value, 
+                     season_long$group, 
+                     p.adjust.method="none")
+# All # P < 0.001
+
+# Max and mean  FRP = only one source - MODIS
+# % Anthro = only one source - FOD
+```
+
+```{r PCA, results=FALSE, fig.show="hide", results="hide"}
+# apply PCA
+set.seed(16233)
+samples_pca_no_anth <- prcomp(na.omit(samples_df_mean_no_anth_no_xy),center=TRUE, scale=TRUE)								# apply PCA
+
+# How many components to keep?
+# 1. Kaiser criterion says that retain components - eigenvalue associated w each component - retain in >1, or reject if <1
+round(samples_pca_no_anth$sdev^2, 2)
+summary(samples_pca_no_anth)
+
+# 1-4>1
+# retain 4 components,  explains ~72% of the variance
+# The summary method describe the importance of the PCs. The first row describe again the standard deviation associated with each PC. The second row shows the proportion of the variance in the data explained by each component while the third row describe the cumulative proportion of explained variance. We can see there that the first two PCs accounts for more than half of the variance of the data.
+
+# another way to do above
+set.seed(16233)
+eig.val <- get_eigenvalue(samples_pca_no_anth)
+eig.val<-cbind(rownames(eig.val), eig.val)
+rownames(eig.val) <- NULL
+eig.val<-eig.val[1:5,]
+eig.val[,1]<-c("PCA 1","PCA 2","PCA 3","PCA 4","PCA 5")
+table_eig<-eig.val %>% 
+  knitr::kable(
+    format = "latex",
+    align = "l",
+    digits = 2,
+    booktabs = TRUE,
+    longtable = TRUE,
+    caption="Table S1. Principal Components Analysis (PCA) components, with the associated eigenvalues and variance from a PCA analysis using all derived fire characteristics across the contiguous United States. The PCA was conducted to determine which fire variables accounted for most of the variance in the data and thus which variables to use to define the pyromes. Based on the Kaiser Criterion, on which components whose eigenvalues >1 are retained, we retain four components for further analysis.The first four PCA components explained 72 percent of the cumulative variance.",
+    col.names = c("Component", "Eigenvalue", "Percent variance", "Cumulative percent variance"),
+    escape = FALSE
+    ) %>%
+  kableExtra::kable_styling(
+      position = "left",
+      latex_options = c("striped", "repeat_header"),
+      stripe_color = "gray!15"
+    )
+
+
+# 2. Scree plot
+# The plot method returns a plot of the variances (y-axis) associated with the PCs (x-axis). The Figure below is useful to decide how many PCs to retain for further analysis. 
+fig_scree<-plot(samples_pca_no_anth, main =" ", type = "l")
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS2.pdf", height=4, width=4)
+plot(samples_pca_no_anth, main =" ", type = "l")
+dev.off()
+
+# What variables are colinear w components?
+# BiPlot
+fig_biplot<-biplot(samples_pca_no_anth, cex=c(1, .5), col=c("white", "black"))
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS3.pdf", height=8, width=6)
+biplot(samples_pca_no_anth, cex=c(1, .5), col=c("white", "black"))
+dev.off()
+
+
+# DotPlot of loadings - PC1
+load    <- samples_pca_no_anth$rotation
+sorted.loadings1 <- load[order(load[, 1]), 1]
+myTitle1 <- "Loadings Plot for PC1" 
+myXlab  <- "Variable Loadings"
+library(lattice)
+fig_dotplota<-dotplot(sorted.loadings1, main=myTitle1, xlab=myXlab, cex=1.5, col="red")
+
+# DotPlot PC2
+sorted.loadings2 <- load[order(load[, 2]), 2]
+myTitle2 <- "Loadings Plot for PC2"
+fig_dotplotb<-dotplot(sorted.loadings2, main=myTitle2, xlab=myXlab, cex=1.5, col="red")
+
+# DotPlot PC3
+sorted.loadings3 <- load[order(load[, 3]), 3]
+myTitle3 <- "Loadings Plot for PC3"
+fig_dotplotc<-dotplot(sorted.loadings3, main=myTitle3, xlab=myXlab, cex=1.5, col="red")
+
+# DotPlot PC4
+sorted.loadings4 <- load[order(load[, 4]), 4]
+myTitle4 <- "Loadings Plot for PC4"
+fig_dotplotd<-dotplot(sorted.loadings4, main=myTitle4, xlab=myXlab, cex=1.5, col="red")
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS4a.pdf", height=5, width=4)
+dotplot(sorted.loadings1, main=paste0("(a) ", myTitle1), xlab=myXlab, cex=1.5, col="red")
+dev.off()
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS4b.pdf", height=5, width=4)
+dotplot(sorted.loadings2, main=paste0("(b) ", myTitle2), xlab=myXlab, cex=1.5, col="red")
+dev.off()
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS4c.pdf", height=5, width=4)
+dotplot(sorted.loadings3, main=paste0("(c) ", myTitle3), xlab=myXlab, cex=1.5, col="red")
+dev.off()
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS4d.pdf", height=5, width=4)
+dotplot(sorted.loadings4, main=paste0("(d) ", myTitle4), xlab=myXlab, cex=1.5, col="red")
+dev.off()
+
+
+var_imp<-get_pca_var(samples_pca_no_anth)
+round(var_imp$cor[,c(1:4)], 2) 	# correlations between variables and dimensions
+round(var_imp$contrib[,c(1:4)], 2)	# Contributions of the variables - The contribution of a variable to a given principal component is (in percentage) : (var.cos2 * 100) / (total cos2 of the component)	
+round(var_imp$cos2[,c(1:4)], 2)	# Cos2 for the variables
+
+var_info<-cbind(names_vector[1:14], round(var_imp$cor[,c(1:4)], 2), round(var_imp$contrib[,c(1:4)], 2))
+var_info_df<-data.frame(var_info)
+var_info_df2<-var_info_df[c(-1,-6:-9)]
+var_info_df2 <- cbind(rownames(var_info_df2), var_info_df2)
+rownames(var_info_df2) <- NULL
+table_PCAcorr<-var_info_df2 %>% 
+  knitr::kable(
+    format = "latex",
+    align = "l",
+    booktabs = TRUE,
+    longtable = TRUE,
+    caption="Table S2. PCA Correlations. Correlations between fire variables and the Principal Components Analysis (PCA) components and the contributions of the fire variables to the components. The PCA analysis used all derived fire characteristics across the contiguous United States and was conducted to determine which fire variables accounted for most of the variance in the data and thus which variables to use to define the pyromes. After determining to keep the first four PCA components based on the Kaiser criterion (Table S1) and by evaluating a scree plot (Figure S2), we determined which of the fire characteristics were associated with these four components using the statistical analysis summarized here and by evaluating a biplot (Figure S3) and dotplots (Figure S4). Every variable in this suite loads significantly onto at least one of the components, so we retain all fire variables for the clustering analysis.",
+    col.names = c("Fire characteristic", "PCA 1", "PCA 2", "PCA 3", "PCA 4"),
+    escape = FALSE
+    ) %>%
+  kableExtra::kable_styling(
+      position = "left",
+      latex_options = c("striped", "repeat_header"),
+      stripe_color = "gray!15"
+    )
+
+```
+
+```{r cluster, cache=TRUE, results="hide"}
+
+# Cluster - (Divisive method)
+# Kmeans option: randomly places specified number of centroids
+
+# kmeans objects for a range of cluster numbers - scaled and centered data
+set.seed(16338)
+fit_no_anth<-vector("list", 150)
+for (i in 1:150) {
+	fit_no_anth[[i]] <- kmeans(samples_df_mean_no_anth_sc,iter.max=10000, centers=i, nstart=100)
+}
+
+#  Evaluate these - how many clusters
+# 1. BIC / AIC
+# Compute AIC and BIC for a range of cluster # s
+set.seed(16338)
+kmeansAIC_BIC <- function(fit){
+	m = ncol(fit$centers)
+	n = length(fit$cluster)
+	k = nrow(fit$centers)
+	D = fit$tot.withinss
+	return(data.frame(AIC = D + 2*m*k,
+		BIC = D + log(n)*m*k))
+}
+
+# make dataframe with AIC and BIC ~ Number of clusters for no anth
+AIC_BIC_df_no_anth<-data.frame()
+for (i in 1:150){
+	AIC_BIC_df_no_anth[i,1]<-kmeansAIC_BIC(fit_no_anth[[i]])[1]
+	AIC_BIC_df_no_anth[i,2]<-kmeansAIC_BIC(fit_no_anth[[i]])[2]
+}
+AIC_BIC_df_no_anth$n_clust<-1:150
+
+max_clust<-AIC_BIC_df_no_anth[AIC_BIC_df_no_anth$BIC==min(AIC_BIC_df_no_anth$BIC),]$n_clust 
+max_clust
+# 39
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS5.pdf", height=5, width=4)
+plot(AIC_BIC_df_no_anth$n_clust,AIC_BIC_df_no_anth$BIC, pch=".", ylim=c(0,100000), xlab="Number of Clusters", ylab="BIC")
+points(AIC_BIC_df_no_anth[AIC_BIC_df_no_anth$BIC==min(AIC_BIC_df_no_anth$BIC),]$n_clust, min(AIC_BIC_df_no_anth$BIC), col="blue")
+text(AIC_BIC_df_no_anth[AIC_BIC_df_no_anth$BIC==min(AIC_BIC_df_no_anth$BIC),]$n_clust, min(AIC_BIC_df_no_anth$BIC-4000), paste0("k=", max_clust))
+legend(x=10, y=80000, legend=c("Data", "Inflection point (min BIC~k)"), pch=c(20, 1), col=c("black", "blue"))
+dev.off()
+
+
+# 2. Dunn ~ k
+dunn_df_no_anth<-rep(0,max_clust)
+for (i in 1:max_clust){
+	dunn_df_no_anth[i]<-dunn(Data=samples_df_mean_no_anth_sc, clusters=fit_no_anth[[i]]$cluster)
+}
+# write.csv(dunn_df_no_anth, "Results/dunn_df_no_anth.csv")
+
+dunn_df_df_no_anth<-data.frame(cbind(2:max_clust, dunn_df_no_anth[2:max_clust]))
+names(dunn_df_df_no_anth)<-c("n_clust", "dunn")
+
+pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/FigS6.pdf", height=4, width=4)
+plot(dunn_df_df_no_anth$n_clust, dunn_df_df_no_anth$dunn, type="o",xlab="Number of clusters", ylab="Dunn Index")
+dev.off()
+
+# local maxima at
+local_max_dunn<-numeric(0)
+local_max_dunn[1]<-2
+for (i in 2:(max(dunn_df_df_no_anth$n_clust)-2)){
+	if(dunn_df_df_no_anth[i,]$dunn>dunn_df_df_no_anth[i-1,]$dunn & dunn_df_df_no_anth[i,]$dunn>dunn_df_df_no_anth[i+1,]$dunn) {
+		local_max_dunn<-c(local_max_dunn, dunn_df_df_no_anth[i,]$n_clust)
+}
+}
+
+for (i in (max(dunn_df_df_no_anth$n_clust)-1)){
+	if(dunn_df_df_no_anth[i,]$dunn>dunn_df_df_no_anth[i-1,]$dunn) {
+		local_max_dunn<-c(local_max_dunn, dunn_df_df_no_anth[i,]$n_clust)
+}
+}
+
+
+# If over a threshold instead of a local max:
+# thresh<-mean(dunn_df_df_no_anth[-1,]$dunn)
+# abline(h=thresh, col="red")
+# dunn_df_df_no_anth[dunn_df_df_no_anth$dunn>thresh,]$n_clust
+
+local_max_dunn
+#  2  5  8 14 19 24 28 30 32 35 37 39
+
+### Add it back in to data frame
+samples_df_k<-samples_df
+samples_df_k$kmeans2<-fit_no_anth[[2]]$cluster
+samples_df_k$kmeans5<-fit_no_anth[[5]]$cluster
+samples_df_k$kmeans8<-fit_no_anth[[8]]$cluster
+samples_df_k$kmeans14<-fit_no_anth[[14]]$cluster
+samples_df_k$kmeans19<-fit_no_anth[[19]]$cluster
+samples_df_k$kmeans24<-fit_no_anth[[24]]$cluster
+samples_df_k$kmeans28<-fit_no_anth[[28]]$cluster
+samples_df_k$kmeans30<-fit_no_anth[[30]]$cluster
+samples_df_k$kmeans32<-fit_no_anth[[32]]$cluster
+samples_df_k$kmeans35<-fit_no_anth[[35]]$cluster
+samples_df_k$kmeans37<-fit_no_anth[[37]]$cluster
+samples_df_k$kmeans39<-fit_no_anth[[39]]$cluster
+
+
+# write.csv(samples_df_k, "Results/samples_df_k.csv")
+# samples_df_k<-read.csv("samples_df_k.csv")
+# samples_df_k<-samples_df_k[,-1]
+
+# % Area of each
+area_fun<-function(cluster_num){
+	(nrow(samples_df_k[samples_df_k$kmeans8==cluster_num,])/ nrow(samples_df_k))
+}
+
+perc_area<-1:8
+total_area<-1:8
+for (i in 1:8){
+	perc_area[i]<-round(area_fun(i)*100, 2)
+	total_area[i]<-area_fun(i) * 7663941.7
+	# 7,663,941.7 km2 total US area
+}
+
+perc_area
+#   2.24 26.67 28.35  6.55  0.67 10.96  0.06 24.49
+
+total_area
+#  171300.595 2043874.226 2172936.318  502168.868   51624.837  840076.892    4693.167 1877266.797
+
+```
+
+
+
+```{r characterize_pyromes, cache=TRUE, results="hide"}
+
+samples_df_k$FID<-1:nrow(samples_df_k)
+samples_df_k_MODIS<-samples_df_k[samples_df_k$Number_fires_MODIS_mean>0,]
+samples_df_k_MTBS<-samples_df_k[samples_df_k$Number_fires_MTBS_mean>0,]
+samples_df_k_FOD<-samples_df_k[samples_df_k$Number_fires_FOD_mean>0,]
+
+mean_char8<-vector("list", 15)
+sd_char8<-vector("list", 15)
+
+for (i in c(1,2,3)){
+	mean_char8[i]<-round(aggregate(samples_df_k[,i], by=list(samples_df_k$kmeans8), FUN=mean)[2],1)
+	sd_char8[i]<-round(aggregate(samples_df_k[,i], by=list(samples_df_k$kmeans8), FUN=sd)[2],1)
+}
+for (i in c(4, 5, 12)){
+	mean_char8[i]<-round(aggregate(samples_df_k_MODIS[,i], by=list(samples_df_k_MODIS$kmeans8), FUN=mean)[2],1)
+	sd_char8[i]<-round(aggregate(samples_df_k_MODIS[,i], by=list(samples_df_k_MODIS$kmeans8), FUN=sd)[2],1)
+}
+for (i in c(6, 7, 10, 13)){
+	mean_char8[i]<-round(aggregate(samples_df_k_MTBS[,i], by=list(samples_df_k_MTBS$kmeans8), FUN=mean)[2],1)
+	sd_char8[i]<-round(aggregate(samples_df_k_MTBS[,i], by=list(samples_df_k_MTBS$kmeans8), FUN=sd)[2],1)
+}
+for (i in c(8, 9, 11, 14, 15)){
+	mean_char8[i]<-round(aggregate(samples_df_k_FOD[,i], by=list(samples_df_k_FOD$kmeans8), FUN=mean)[2],1)
+	sd_char8[i]<-round(aggregate(samples_df_k_FOD[,i], by=list(samples_df_k_FOD$kmeans8), FUN=sd)[2],1)
+}
+
+mean_char8_df <- data.frame(matrix(unlist(mean_char8), nrow=15, byrow=T))
+sd_char8_df <- data.frame(matrix(unlist(sd_char8), nrow=15, byrow=T))
+
+# write.table(mean_char8_df, "Results/mean_char8_df.txt")
+
+
+fire_char_pyrome8<-cbind(mean_char8_df,sd_char8_df)
+names(fire_char_pyrome8)<-c(paste0(1:8), paste0("Pyrome ", 1:8, " Sd"))
+
+fire_characteristics_pyrome8<-fire_char_pyrome8
+fire_characteristics_pyrome8<-data.frame(matrix(NA, nrow = 15, ncol = 8))
+names(fire_characteristics_pyrome8)<-1:8
+for(i in 1:8){
+	fire_characteristics_pyrome8[,i]<-paste0(mean_char8_df[,i], " (+/-", sd_char8_df[,i], ")")
+}
+# write.table(fire_characteristics_pyrome8, "Results/fire_characteristics_pyrome8.txt")
+# fire_characteristics_pyrome8<-read.table("Results/fire_characteristics_pyrome8.txt")
+
+
+# fit anlaysis of variance test for each fire characteristic as a function of which cluster it belongs to (not great if not balanced) and Tukey's is post-hoc where the differences are. Check to make sure pyrome with highest value sig diff from next highest value 
+anov_results8<-vector("list", 15)							# empty list
+Tukey8<-vector("list", 15)																	# empty list
+for (i in 1:15){
+	anov_results8[[i]]<-aov(formula=samples_df_k[,i]~as.factor(samples_df_k$kmeans8))
+	Tukey8[i]<-TukeyHSD(anov_results8[[i]])
+}
+
+names(Tukey8)<-c(names(samples_df_k[1:15]))
+
+Tukey_sig8<-vector("list", 15)
+for (i in 1:15){
+	Tukey_sig8[[i]]<-ifelse(Tukey8[[i]][,"p adj"]<=0.01, "***", 
+	ifelse(Tukey8[[i]][,"p adj"]>0.01 & Tukey8[[i]][,"p adj"]<=0.05, "**",
+	ifelse(Tukey8[[i]][,"p adj"]>0.05 & Tukey8[[i]][,"p adj"]<=0.1, "*", -9999)))
+}
+
+# Get pyrome number with highest mean value for each characteristic
+high_char<-colnames(fire_char_pyrome8)[max.col(fire_char_pyrome8[,1:8])]
+
+# get pyromes that have value that is not sig diff from the pyrome with the highest value (any Tukey_sig8 value -9999 not sig diff). Automate later if possible
+# change color in table
+# For example, which(Tukey_sig8[[1]]=="-9999") shows that Pyromes 1, 4, and 7 are not diff from pyrome 5, the pyrome with the highest values for characteristic 1 (add 1 to that value for the below to represent the correct column in the table, since the fire characteristics are col 1)
+which(Tukey_sig8[[1]]=="-9999") #1, 4, 7
+which(Tukey_sig8[[2]]=="-9999") 
+which(Tukey_sig8[[3]]=="-9999") #7
+which(Tukey_sig8[[4]]=="-9999") #1,7
+which(Tukey_sig8[[5]]=="-9999") #6,7
+which(Tukey_sig8[[6]]=="-9999") 
+which(Tukey_sig8[[7]]=="-9999")
+which(Tukey_sig8[[8]]=="-9999")
+which(Tukey_sig8[[9]]=="-9999")
+which(Tukey_sig8[[10]]=="-9999")
+which(Tukey_sig8[[11]]=="-9999")
+which(Tukey_sig8[[12]]=="-9999") #7
+which(Tukey_sig8[[13]]=="-9999")
+which(Tukey_sig8[[14]]=="-9999") #7
+which(Tukey_sig8[[15]]=="-9999")
+
+high_char_not_diff<-vector(mode="list", length=15)
+high_char_not_diff[[1]]<-c(1, 4, 7)
+high_char_not_diff[[3]]<-c(7)
+high_char_not_diff[[4]]<-c(1, 7)
+high_char_not_diff[[5]]<-c(6, 7)
+high_char_not_diff[[12]]<-c(7)
+high_char_not_diff[[14]]<-c(7)
+
+
+# Annual trends
+# grab all the annual data, kmeans8 value, and FID
+# names(samples_df_k)
+
+samples_clust_num<-samples_df_k[,c((substr(names(samples_df_k), 7, 14)=="Numfires")|(substr(names(samples_df_k), 6, 11)=="Numfires")|(substr(names(samples_df_k), 5, 12)=="Numfires"), 435,441)]
+samples_clust_MODIS<-cbind((samples_df_k_MODIS[ , substr(names(samples_df_k_MODIS), 1, 5)=="MODIS"]), (samples_df_k_MODIS[,c(435, 441)]))
+samples_clust_MTBS<-cbind((samples_df_k_MTBS[ , substr(names(samples_df_k_MTBS), 1, 4)=="MTBS"]), (samples_df_k_MTBS[,c(435, 441)]))
+samples_clust_FOD<-cbind((samples_df_k_FOD[ , substr(names(samples_df_k_FOD), 1, 3)=="FOD"]), (samples_df_k_FOD[,c(435, 441)]))
+
+samples_long1<-gather(samples_clust_num, key=variable, value=value, -FID, -kmeans8)
+samples_long2<-gather(samples_clust_MODIS, key=variable, value=value, -FID, -kmeans8)
+samples_long3<-gather(samples_clust_MTBS, key=variable, value=value, -FID, -kmeans8)
+samples_long4<-gather(samples_clust_FOD, key=variable, value=value, -FID, -kmeans8)
+samples_long<-rbind(samples_long1, samples_long2, samples_long3, samples_long4)
+head(samples_long)
+
+# add year column
+extractYear <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+}
+samples_long$year<-extractYear(samples_long$variable, 4)
+samples_long$year<-as.numeric(samples_long$year)
+unique(samples_long$variable)
+unique(samples_long$year)
+
+# look at various fire variables over time, colored by cluster #
+#MODIS_numfires
+# MODIS_maxFRP
+# MODIS_sdJD
+# MTBS_maxarea
+# MTBS_pac
+# FOD_perchum
+
+MODIS_numfires<-samples_long[grep("MODIS_Numfires_", samples_long$variable),]
+MODIS_numfires$time<-MODIS_numfires$year - min(MODIS_numfires$year)
+
+MTBS_numfires<-samples_long[grep("MTBS_Numfires_", samples_long$variable),]
+MTBS_numfires$time<-MTBS_numfires$year - min(MTBS_numfires$year)
+
+FOD_numfires<-samples_long[grep("FOD_Numfires_", samples_long$variable),]
+FOD_numfires$time<-FOD_numfires$year - min(FOD_numfires$year)
+
+MODIS_maxFRP<-samples_long[grep("MODIS_maxFRP_", samples_long$variable),]
+MODIS_maxFRP$time<-MODIS_maxFRP$year - min(MODIS_maxFRP$year)
+
+MODIS_meanFRP<-samples_long[grep("MODIS_meanFRP_", samples_long$variable),]
+MODIS_meanFRP$time<-MODIS_meanFRP$year - min(MODIS_meanFRP$year)
+
+MTBS_maxArea<-samples_long[grep("MTBS_maxArea_", samples_long$variable),]
+MTBS_maxArea$time<-MTBS_maxArea$year - min(MTBS_maxArea$year)
+
+MTBS_meanArea<-samples_long[grep("MTBS_meanArea_", samples_long$variable),]
+MTBS_meanArea$time<-MTBS_meanArea$year - min(MTBS_meanArea$year)
+
+MTBS_sumArea<-samples_long[grep("MTBS_sumArea_", samples_long$variable),]
+MTBS_sumArea$time<-MTBS_sumArea$year - min(MTBS_sumArea$year)
+
+FOD_maxArea<-samples_long[grep("FOD_maxArea_", samples_long$variable),]
+FOD_maxArea$time<-FOD_maxArea$year - min(FOD_maxArea$year)
+
+FOD_meanArea<-samples_long[grep("FOD_meanArea_", samples_long$variable),]
+FOD_meanArea$time<-FOD_meanArea$year - min(FOD_meanArea$year)
+
+FOD_sumArea<-samples_long[grep("FOD_sumArea_", samples_long$variable),]
+FOD_sumArea$time<-FOD_sumArea$year - min(FOD_sumArea$year)
+
+MTBS_stdJD<-samples_long[grep("MTBS_stdJD_", samples_long$variable),]
+MTBS_stdJD$time<-MTBS_stdJD$year - min(MTBS_stdJD$year)
+
+MODIS_stdJD<-samples_long[grep("MODIS_stdJD_", samples_long$variable),]
+MODIS_stdJD$time<-MODIS_stdJD$year - min(MODIS_stdJD$year)
+
+FOD_stdJD<-samples_long[grep("FOD_stdJD_", samples_long$variable),]
+FOD_stdJD$time<-FOD_stdJD$year - min(FOD_stdJD$year)
+
+Perc_human<-samples_long[grep("FOD_Number_fires_human_", samples_long$variable),]
+Perc_human$time<-Perc_human$year - min(Perc_human$year)
+
+# Function to compute mean annual values of a fire characteristic (title) by pyrome (kmeans8)
+mean_annual_value_by_group<-function(title){
+	value_by_group<-title %>% 
+		group_by(kmeans8, time) %>% 
+		summarise(
+			count = n(),
+			value_by_group = mean(value, na.rm = TRUE)
+	)
+	value_by_group
+}
+ 
+
+# create a list of these characteristics to pass to function above
+fire_chars<-list(MODIS_numfires, MTBS_numfires, FOD_numfires, MODIS_meanFRP, MODIS_maxFRP, MTBS_meanArea, MTBS_maxArea, FOD_meanArea, FOD_maxArea, MTBS_sumArea, FOD_sumArea, MTBS_stdJD, MODIS_stdJD, FOD_stdJD, Perc_human)
+
+# pass this list to function above
+detach("package:plyr", unload=TRUE) 
+grouped_list=vector("list", 15)
+for (i in 1:15){
+	grouped_list[[i]]<-mean_annual_value_by_group(fire_chars[[i]])
+}
+
+# if get an error - detach("package:plyr", unload=TRUE) 
+
+names(grouped_list)<-names_vector
+
+for(i in c(1,4, 5, 12)){
+	grouped_list[[i]]$year<-grouped_list[[i]]$time+2003
+}
+
+for(i in c(2, 6, 7, 10, 13)){
+	grouped_list[[i]]$year<-grouped_list[[i]]$time+1984
+}
+
+for(i in c(3, 8, 9, 11, 14, 15)){
+	grouped_list[[i]]$year<-grouped_list[[i]]$time+1992
+}
+
+library(rlist)
+# list.save(grouped_list, file = "Results/grouped_list.rds")
+
+# Fit linear model for each
+
+library(nlme)
+lm_summary_list<-vector("list", 15)
+for (i in 1:15){
+	lm_summary_list[[i]]<-summary(lmList(value ~ time | kmeans8, data=fire_chars[[i]], na.action=na.omit))
+}
+
+
+# Slopes of groups 1-8
+slopes<-data.frame(matrix(NA, nrow = 15, ncol = 8))
+names(slopes)<-c("1", "2", "3", "4", "5", "6", "7", "8")
+kmeans_num<-8
+
+for (i in 1:15){
+  for (n in 1:kmeans_num){
+    slopes[i, n]<-round(lm_summary_list[[i]]$coefficients[((8*4)+n)], 2)
+  }
+}
+
+# get pyrome with steepest slope for each characteristic (row)
+pyrome_steep_slope<-as.numeric(colnames(slopes)[max.col(slopes)])
+steep_slope<-apply(slopes, 1, max) 
+
+
+for (i in 1:15){
+  for (n in 1:kmeans_num){
+    slopes[i, n]<-paste0(round(lm_summary_list[[i]]$coefficients[((8*4)+n)], 2), " (+/-", round(lm_summary_list[[i]]$coefficients[((8*5)+n)], 2), ")", 
+  	ifelse(lm_summary_list[[i]]$coefficients[((8*7)+n)]>0.1, " ",
+	  ifelse(lm_summary_list[[i]]$coefficients[((8*7)+n)]>0.05 & lm_summary_list[[i]]$coefficients[((8*7)+n)]<=0.1, "*",
+  	ifelse(lm_summary_list[[i]]$coefficients[((8*7)+n)]>0.01 & lm_summary_list[[i]]$coefficients[((8*7)+n)]<=0.05, "**",
+	  ifelse(lm_summary_list[[i]]$coefficients[((8*7)+n)]<=0.01, "***", NA)))))
+  }
+}
+
+# write.table(slopes, "Results/slopes8.txt")
+
+
+
+# upper ci of slopes (slopes_ci) of groups 1-8
+
+slopes_ci<-data.frame(matrix(NA, nrow = 15, ncol = 8))
+names(slopes_ci)<-c("1", "2", "3", "4", "5", "6", "7", "8")
+
+# upper end of ci for slopes 
+for (i in 1:15){
+    for (n in 1:kmeans_num){
+	slopes_ci[i, n]<-round(lm_summary_list[[i]]$coefficients[((8*4)+n)], 4) + round(lm_summary_list[[i]]$coefficients[((8*5)+n)], 4)
+  }
+}
+
+
+# get pyromes with upper ci >= steepest slope for each characteristic (row), excluding one w steepest
+steep_ci<-vector(mode="list", length=15)
+for(i in 1:15){
+  steep_ci[[i]]<- colnames(slopes_ci)[apply(slopes_ci[i,], 2, function(x) any(x>=steep_slope[i]))]
+  steep_ci[[i]]<-steep_ci[[i]][steep_ci[[i]]!=pyrome_steep_slope[i]]
+}
+# steep_ci
+
+
+# Table of values and slopes of characteristics
+# fire_characteristics_pyrome8
+fire_characteristics_pyrome8<-cbind(names_vector, fire_characteristics_pyrome8)
+# slopes
+slopes<-cbind(names_vector, slopes)
+
+library(gdata)
+char_slopes_merged<-do.call(interleave, lapply(list(fire_characteristics_pyrome8, slopes), setNames, paste0("V", 1:ncol(fire_characteristics_pyrome8))))
+table_char_slopes<-cbind(c(rbind(names_vector, (rep(c(" "), 15)))), (rep(c("Value", "Slope"),15)), char_slopes_merged[,2:9])
+names(table_char_slopes)<-c("Fire characteristic", " ", paste0("Pyrome ", 1:8))
+# write.table(table_char_slopes, "Results/table_char_slopes.txt")
+
+# Pyrome number with highest mean value for each characteristic is in vector high_char
+# Pyrome number with highest slope for each characteristic is in vector pyrome_steep_slope
+# Syntax for making those values red and bold is like below for cell [1,6]:
+# table_char_slopes_latex[1,6] <- cell_spec(table_char_slopes_latex[1,6], "latex", bold=TRUE, color = "red")
+# loop through to set the pyromes with the highest values for each characteristic (added 2 to column bc first 2 rows characters)
+table_char_slopes_latex<-table_char_slopes
+high_char_slopes<-as.numeric(c(rbind(high_char, pyrome_steep_slope)))
+
+for (i in 1:30){
+  table_char_slopes_latex[i, (high_char_slopes[i]+2)] <- cell_spec(table_char_slopes_latex[i, (high_char_slopes[i]+2)], "latex", bold=TRUE, color = "red")
+}
+
+# Pyrome numbers where mean value not significantly different from the highest for each characteristic is in list high_char_not_diff. Remeber blank row in between each, so change row num accordingly (*2-1). Add 2 to col num to account for char cols
+
+high_char_not_diff_30rows<-vector(mode="list", length=30)
+high_char_not_diff_30rows[[1]]<-c(1, 4, 7)
+high_char_not_diff_30rows[[5]]<-c(7)
+high_char_not_diff_30rows[[7]]<-c(1, 7)
+high_char_not_diff_30rows[[9]]<-c(6, 7)
+high_char_not_diff_30rows[[23]]<-c(7)
+high_char_not_diff_30rows[[27]]<-c(7)
+
+table_char_slopes_latex[1,3] <- cell_spec(table_char_slopes_latex[1,3], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[1,6] <- cell_spec(table_char_slopes_latex[1,6], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[1,9] <- cell_spec(table_char_slopes_latex[1,9], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[5,9] <- cell_spec(table_char_slopes_latex[5,9], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[7,3] <- cell_spec(table_char_slopes_latex[7,3], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[7,9] <- cell_spec(table_char_slopes_latex[7,9], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[9,8] <- cell_spec(table_char_slopes_latex[1,8], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[9,9] <- cell_spec(table_char_slopes_latex[9,9], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[23,9] <- cell_spec(table_char_slopes_latex[23,9], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[27,9] <- cell_spec(table_char_slopes_latex[27,9], "latex", italic=TRUE, color = "orange")
+
+
+# Pyrome numbers where ci overlaps steepest slope is in list steep_ci. Remeber blank row in between each, so change row number accordingly (*2). Add 2 to col num to account for char cols
+
+# steep_ci
+steep_ci_30rows<-vector(mode="list", length=30)
+steep_ci_30rows[[6]]<-c(5,7)
+steep_ci_30rows[[8]]<-c(5)
+steep_ci_30rows[[14]]<-c(7)
+steep_ci_30rows[[26]]<-c(1)
+steep_ci_30rows[[28]]<-c(7)
+
+
+table_char_slopes_latex[6,7] <- cell_spec(table_char_slopes_latex[6,7], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[6,9] <- cell_spec(table_char_slopes_latex[6,9], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[8,7] <- cell_spec(table_char_slopes_latex[8,7], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[14,9] <- cell_spec(table_char_slopes_latex[14,9], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[26,3] <- cell_spec(table_char_slopes_latex[26,3], "latex", italic=TRUE, color = "orange")
+table_char_slopes_latex[28,9] <- cell_spec(table_char_slopes_latex[28,9], "latex", italic=TRUE, color = "orange")
+
+rownames(table_char_slopes_latex) <- NULL
+
+table_fire_char8<-table_char_slopes_latex %>% 
+  knitr::kable(
+    format = "latex",
+    align = "l",
+    digits = 2,
+    booktabs = TRUE,
+    longtable = TRUE,
+    escape=F,
+    caption="Table S3. Fire characteristics of each pyrome. Mean and standard deviation values of each fire characteristic by pyrome and slope of the linear model of each fire characteristic as a function of time for each pyrome across the contiguous United States. The highest mean value for each characteristic is in red and bold. Mean values that are not statistically significantly different from the highest value (Tukey’s Post Hoc Test on One-way analysis of variance greater than 0.1) are in orange and italicized The steepest slope for each characteristic is in red and bold. Slope values whose confidence intervals overlap with the steepest slope are in orange and italicized. Codes for significance of the slope: *** less than or equal to 0.01, ** less than or equal to 0.05, * less than or equal to 0.1." ) %>%
+  kableExtra::kable_styling(
+      font_size=7.3,
+      position = "left",   
+      latex_options = c("striped", "repeat_header"),
+      stripe_color = "gray!15"
+    )
+  
+```
+
+```{r characterize_pyromes5, cache=TRUE, results="hide"}
+# Annual trends - done above for kmeans8, below for kmeans 5
+# grab all the annual data, kmeans5 value, and FID
+# names(samples_df_k)
+
+samples_clust_num5<-samples_df_k[,c((substr(names(samples_df_k), 7, 14)=="Numfires")|(substr(names(samples_df_k), 6, 11)=="Numfires")|(substr(names(samples_df_k), 5, 12)=="Numfires"), 435,440)]
+samples_clust_MODIS5<-cbind((samples_df_k_MODIS[ , substr(names(samples_df_k_MODIS), 1, 5)=="MODIS"]), (samples_df_k_MODIS[,c(435, 440)]))
+samples_clust_MTBS5<-cbind((samples_df_k_MTBS[ , substr(names(samples_df_k_MTBS), 1, 4)=="MTBS"]), (samples_df_k_MTBS[,c(435, 440)]))
+samples_clust_FOD5<-cbind((samples_df_k_FOD[ , substr(names(samples_df_k_FOD), 1, 3)=="FOD"]), (samples_df_k_FOD[,c(435, 440)]))
+
+samples_long15<-gather(samples_clust_num5, key=variable, value=value, -FID, -kmeans5)
+samples_long25<-gather(samples_clust_MODIS5, key=variable, value=value, -FID, -kmeans5)
+samples_long35<-gather(samples_clust_MTBS5, key=variable, value=value, -FID, -kmeans5)
+samples_long45<-gather(samples_clust_FOD5, key=variable, value=value, -FID, -kmeans5)
+samples_long5<-rbind(samples_long15, samples_long25, samples_long35, samples_long45)
+head(samples_long5)
+
+# add year column
+extractYear5 <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+}
+samples_long5$year<-extractYear(samples_long5$variable, 4)
+samples_long5$year<-as.numeric(samples_long5$year)
+# unique(samples_long5$variable)
+# unique(samples_long5$year)
+
+
+MODIS_numfires5<-samples_long5[grep("MODIS_Numfires_", samples_long5$variable),]
+MODIS_numfires5$time<-MODIS_numfires5$year - min(MODIS_numfires5$year)
+
+MTBS_numfires5<-samples_long5[grep("MTBS_Numfires_", samples_long5$variable),]
+MTBS_numfires5$time<-MTBS_numfires5$year - min(MTBS_numfires5$year)
+
+FOD_numfires5<-samples_long5[grep("FOD_Numfires_", samples_long5$variable),]
+FOD_numfires5$time<-FOD_numfires5$year - min(FOD_numfires5$year)
+
+MODIS_maxFRP5<-samples_long5[grep("MODIS_maxFRP_", samples_long5$variable),]
+MODIS_maxFRP5$time<-MODIS_maxFRP5$year - min(MODIS_maxFRP5$year)
+
+MODIS_meanFRP5<-samples_long5[grep("MODIS_meanFRP_", samples_long5$variable),]
+MODIS_meanFRP5$time<-MODIS_meanFRP5$year - min(MODIS_meanFRP5$year)
+
+MTBS_maxArea5<-samples_long5[grep("MTBS_maxArea_", samples_long5$variable),]
+MTBS_maxArea5$time<-MTBS_maxArea5$year - min(MTBS_maxArea5$year)
+
+MTBS_meanArea5<-samples_long5[grep("MTBS_meanArea_", samples_long5$variable),]
+MTBS_meanArea5$time<-MTBS_meanArea5$year - min(MTBS_meanArea5$year)
+
+MTBS_sumArea5<-samples_long5[grep("MTBS_sumArea_", samples_long5$variable),]
+MTBS_sumArea5$time<-MTBS_sumArea5$year - min(MTBS_sumArea5$year)
+
+FOD_maxArea5<-samples_long5[grep("FOD_maxArea_", samples_long5$variable),]
+FOD_maxArea5$time<-FOD_maxArea5$year - min(FOD_maxArea5$year)
+
+FOD_meanArea5<-samples_long5[grep("FOD_meanArea_", samples_long5$variable),]
+FOD_meanArea5$time<-FOD_meanArea5$year - min(FOD_meanArea5$year)
+
+FOD_sumArea5<-samples_long5[grep("FOD_sumArea_", samples_long5$variable),]
+FOD_sumArea5$time<-FOD_sumArea5$year - min(FOD_sumArea5$year)
+
+MTBS_stdJD5<-samples_long5[grep("MTBS_stdJD_", samples_long5$variable),]
+MTBS_stdJD5$time<-MTBS_stdJD5$year - min(MTBS_stdJD5$year)
+
+MODIS_stdJD5<-samples_long5[grep("MODIS_stdJD_", samples_long5$variable),]
+MODIS_stdJD5$time<-MODIS_stdJD5$year - min(MODIS_stdJD5$year)
+
+FOD_stdJD5<-samples_long5[grep("FOD_stdJD_", samples_long5$variable),]
+FOD_stdJD5$time<-FOD_stdJD5$year - min(FOD_stdJD5$year)
+
+Perc_human5<-samples_long5[grep("FOD_Number_fires_human_", samples_long5$variable),]
+Perc_human5$time<-Perc_human5$year - min(Perc_human5$year)
+
+# Function to compute mean annual values of a fire characteristic (title) by pyrome (kmeans5)
+mean_annual_value_by_group5<-function(title){
+	value_by_group5<-title %>% 
+		group_by(kmeans5, time) %>% 
+		summarise(
+			count = n(),
+			value_by_group5 = mean(value, na.rm = TRUE)
+	)
+	value_by_group5
+}
+ 
+
+# create a list of these characteristics to pass to function above
+fire_chars5<-list(MODIS_numfires5, MTBS_numfires5, FOD_numfires5, MODIS_meanFRP5, MODIS_maxFRP5, MTBS_meanArea5, MTBS_maxArea5, FOD_meanArea5, FOD_maxArea5, MTBS_sumArea5, FOD_sumArea5, MTBS_stdJD5, MODIS_stdJD5, FOD_stdJD5, Perc_human5)
+
+# pass this list to function above
+detach("package:plyr", unload=TRUE) 
+grouped_list5=vector("list", 15)
+for (i in 1:15){
+	grouped_list5[[i]]<-mean_annual_value_by_group5(fire_chars5[[i]])
+}
+
+# if get an error - detach("package:plyr", unload=TRUE) 
+
+names(grouped_list5)<-names_vector
+
+for(i in c(1,4, 5, 12)){
+	grouped_list5[[i]]$year<-grouped_list5[[i]]$time+2003
+}
+
+for(i in c(2, 6, 7, 10, 13)){
+	grouped_list5[[i]]$year<-grouped_list5[[i]]$time+1984
+}
+
+for(i in c(3, 8, 9, 11, 14, 15)){
+	grouped_list5[[i]]$year<-grouped_list5[[i]]$time+1992
+}
+
+library(rlist)
+# list.save(grouped_list5, file = "Results/grouped_list5.rds")
+```
+
+```{r sample_other_groups, cache=TRUE, results="hide"}
+samples_df_spatial<-samples_df_k
+coordinates(samples_df_spatial)<-~x + y														# make it spatial
+proj4string(samples_df_spatial)<-CRS(data_crs)
+#writeOGR(samples_df_spatial, dsn="Results", layer="samples_df_spatial", driver="ESRI Shapefile")
+
+samples_buffer <-st_buffer(st_as_sf(samples_df_spatial), 35355.34) 
+
+library(exactextractr)
+# 1. Climate											  					
+detach("package:plyr", unload=TRUE) 
+clim<- raster("Climate/Beck_KG_V1_present_0p0083.tif")
+samples_proj_clim<-spTransform(samples_df_spatial, crs(clim))
+samples_buffer_clim <-st_buffer(st_as_sf(samples_proj_clim), 35355.34) 
+samples_clim_kmeans8<-exactextractr::exact_extract(clim, samples_buffer_clim, function(df) df %>% group_by(kmeans8, value) %>% summarize(tot = n()) %>% pivot_wider(kmeans8, names_from = value, values_from = tot), summarize_df = TRUE, include_cols = 'kmeans8') # this produces a data frame where the rows are kmeans8 of samples and cols are pixel values - 3266 rows
+
+# library(plyr)
+# library(dplyr)
+clim_agg<-as.data.frame(samples_clim_kmeans8)
+clim_agg[is.na(clim_agg)]<-0
+clim_agg$kmeans8<-as.factor(clim_agg$kmeans8)
+clim_sum_kmeans8 <- aggregate(.~kmeans8, data=clim_agg, FUN=sum)
+clim_sum_kmeans8$tot_pix<-rowSums(clim_sum_kmeans8[,2:length(names(clim_sum_kmeans8))])
+
+clim_sum_kmeans8_percent<-clim_sum_kmeans8
+for (i in 2:length(names(clim_sum_kmeans8))){
+  clim_sum_kmeans8_percent[,i]<-round((clim_sum_kmeans8[,i]/clim_sum_kmeans8[,(length(names(clim_sum_kmeans8)))])*100, 1)
+}
+
+
+# 2. NLCD
+NLCD<- raster("NLCD/nlcd_2016_land_cover_l48_20210604.img")	
+samples_proj_NLCD<-spTransform(samples_df_spatial, crs(NLCD))
+samples_buffer_NLCD <-st_buffer(st_as_sf(samples_proj_NLCD), 35355.34) 
+samples_NLCD_kmeans8<-exactextractr::exact_extract(NLCD, samples_buffer_NLCD, function(df) df %>% group_by(kmeans8, value) %>% summarize(tot = n()) %>% pivot_wider(kmeans8, names_from = value, values_from = tot), summarize_df = TRUE, include_cols = 'kmeans8')
+
+# library(plyr)
+# library(dplyr)
+NLCD_agg<-as.data.frame(samples_NLCD_kmeans8)
+NLCD_agg[is.na(NLCD_agg)]<-0
+NLCD_agg$kmeans8<-as.factor(NLCD_agg$kmeans8)
+NLCD_sum_kmeans8 <- aggregate(.~kmeans8, data=NLCD_agg, FUN=sum)
+NLCD_sum_kmeans8$tot_pix<-rowSums(NLCD_sum_kmeans8[,2:length(names(NLCD_sum_kmeans8))])
+
+NLCD_sum_kmeans8_percent<-NLCD_sum_kmeans8
+for (i in 2:length(names(NLCD_sum_kmeans8))){
+  NLCD_sum_kmeans8_percent[,i]<-round((NLCD_sum_kmeans8[,i]/NLCD_sum_kmeans8[,(length(names(NLCD_sum_kmeans8)))])*100, 1)
+}
+
+
+# 3. Landfire
+FRG<- raster("FRG/Tif/us_105frg.tif")	
+samples_proj_FRG<-spTransform(samples_df_spatial, crs(FRG))
+samples_buffer_FRG <-st_buffer(st_as_sf(samples_proj_FRG), 35355.34) 
+samples_FRG_kmeans8<-exactextractr::exact_extract(FRG, samples_buffer_FRG, function(df) df %>% group_by(kmeans8, value) %>% summarize(tot = n()) %>% pivot_wider(kmeans8, names_from = value, values_from = tot), summarize_df = TRUE, include_cols = 'kmeans8') 
+
+# library(plyr)
+# library(dplyr)
+FRG_agg<-as.data.frame(samples_FRG_kmeans8)
+FRG_agg[is.na(FRG_agg)]<-0
+FRG_agg$kmeans8<-as.factor(FRG_agg$kmeans8)
+FRG_sum_kmeans8 <- aggregate(.~kmeans8, data=FRG_agg, FUN=sum)
+FRG_sum_kmeans8$tot_pix<-rowSums(FRG_sum_kmeans8[,2:length(names(FRG_sum_kmeans8))])
+
+FRG_sum_kmeans8_percent<-FRG_sum_kmeans8
+for (i in 2:length(names(FRG_sum_kmeans8))){
+  FRG_sum_kmeans8_percent[,i]<-round((FRG_sum_kmeans8[,i]/FRG_sum_kmeans8[,(length(names(FRG_sum_kmeans8)))])*100, 1)
+}
+
+```
+
+
+```{r compare_other_groups, cache=TRUE, results="hide"}
+    options(knitr.kable.NA = '')
+
+samples_df_k$kmeans8<-as.factor(samples_df_k$kmeans8)
+## Ignitions
+samples_df_k$anthro<-ifelse(samples_df_k$Perc_human_FOD_mean>=0.75, "Anthro", 
+ifelse(samples_df_k$Perc_human_FOD_mean<=0.25, "Lightning", "Neither"))
+
+#detach("package:plyr", unload=TRUE) 
+samples_df_k$anthro_fac<-as.factor(samples_df_k$anthro)
+ign_ls <- samples_df_k %>% 
+  group_by(kmeans8, anthro_fac, .drop=FALSE) %>% 
+  dplyr::summarise(n=n()) %>% 
+  group_by(kmeans8) %>% 
+  mutate(perc=100*n/sum(n))
+ign_ls$kmeans8<-as.factor(ign_ls$kmeans8)  
+ign_df<-data.frame(ign_ls)
+
+ign_table<-ign_df[,c(1,2,4)]
+ign_table[,3]<-round(ign_table[,3],1)
+# write.csv(ign_table, "Results/ign_table.csv")
+
+
+
+
+## Climate Zone
+clim_long<-gather(clim_sum_kmeans8_percent[,c(-(length(names(clim_sum_kmeans8_percent))))], key = Clim, value=percent, -kmeans8)
+
+clim_long$climate<-ifelse(clim_long$Clim==1, "Af: Tropical - Rainforest", 
+ifelse(clim_long$Clim==2, "Am: Tropical - Monsoon", 
+ifelse(clim_long$Clim==3, "Aw: Tropical - Savannah", 
+ifelse(clim_long$Clim==4, "BWh: Arid - Desert Hot", 
+ifelse(clim_long$Clim==5, "BWk: Arid - Desert Cold", 
+ifelse(clim_long$Clim==6, "BSh: Arid - Steppe Hot", 
+ifelse(clim_long$Clim==7, "BSk: Arid - Steppe Cold", 
+ifelse(clim_long$Clim==8, "Csa: Temperate - Dry Summer Hot Summer", 
+ifelse(clim_long$Clim==9, "Csb: Temperate - Dry Summer Warm Summer", 
+ifelse(clim_long$Clim==14, "Cfa: Temperate - Without Dry Season Hot Summer", 
+ifelse(clim_long$Clim==15, "Cfb: Temperate - Without Dry Season  Warm Summer", 
+ifelse(clim_long$Clim==17, "Dsa: Cold - Dry Summer Hot Summer", 
+ifelse(clim_long$Clim==18, "Dsb: Cold - Dry Summer Warm Summer", 
+ifelse(clim_long$Clim==19, "Dsc: Cold - Dry Summer Cold Summer", 
+ifelse(clim_long$Clim==21, "Dwa: Cold - Dry Winter Hot Summer", 
+ifelse(clim_long$Clim==22, "Dwb: Cold - Dry Winter Warm Summer", 
+ifelse(clim_long$Clim==25, "Dfa: Cold - Without Dry Season Hot Summer", 
+ifelse(clim_long$Clim==26, "Dfb: Cold - Without Dry Season Warm Summer", 
+ifelse(clim_long$Clim==27, "Dfc: Cold - Without Dry Season Cold Summer", 
+ifelse(clim_long$Clim==29 | clim_long$Clim==31, "Et: Polar Tundra", 
+ifelse(clim_long$Clim==0, NA, 
+-9999)))))))))))))))))))))
+
+clim_long$climate2<-ifelse(clim_long$Clim==1, "Tropical", 
+ifelse(clim_long$Clim==2, "Tropical", 
+ifelse(clim_long$Clim==3, "Tropical", 
+ifelse(clim_long$Clim==4, "Arid", 
+ifelse(clim_long$Clim==5, "Arid", 
+ifelse(clim_long$Clim==6, "Arid", 
+ifelse(clim_long$Clim==7, "Arid", 
+ifelse(clim_long$Clim==8, "Temperate", 
+ifelse(clim_long$Clim==9, "Temperate", 
+ifelse(clim_long$Clim==14, "Temperate", 
+ifelse(clim_long$Clim==15, "Temperate", 
+ifelse(clim_long$Clim==17, "Cold", 
+ifelse(clim_long$Clim==18, "Cold", 
+ifelse(clim_long$Clim==19, "Cold", 
+ifelse(clim_long$Clim==21, "Cold", 
+ifelse(clim_long$Clim==22, "Cold", 
+ifelse(clim_long$Clim==25, "Cold", 
+ifelse(clim_long$Clim==26, "Cold", 
+ifelse(clim_long$Clim==27, "Cold", 
+ifelse(clim_long$Clim==29 | clim_long$Clim==31, "Polar Tundra", 
+ifelse(clim_long$Clim==0, NA, 
+-9999)))))))))))))))))))))
+
+clim_ls <- clim_long[,c(1, 4, 3)] %>% 
+  group_by(kmeans8, climate)
+clim_ls$kmeans8<-as.factor(clim_ls$kmeans8) 
+clim_df<-data.frame(clim_ls)
+clim_df_1<-clim_df[order(clim_df$kmeans8, clim_df$climate),]
+clim_df_2<-clim_df_1[clim_df_1$climate!="-9999",]
+# write.csv(clim_df_2, "Results/clim_table.csv")
+
+clim_ls2 <- clim_long[,c(1, 5, 3)] %>% 
+  group_by(kmeans8, climate2)
+clim_ls2$kmeans8<-as.factor(clim_ls2$kmeans8)  
+clim_df2<-data.frame(clim_ls2)
+clim_df3<-clim_df2[clim_df2$climate2!="-9999",]
+# write.csv(clim_df3, "Results/clim_table2.csv")
+
+
+## NLCD
+NLCD_long<-gather(NLCD_sum_kmeans8_percent[,c(-(length(names(NLCD_sum_kmeans8_percent))))], key = NLCD, value=percent, -kmeans8)
+
+NLCD_long$landcover<-ifelse(NLCD_long$NLCD>=11 & NLCD_long$NLCD<=12, "Water",
+ifelse(NLCD_long$NLCD>=21 & NLCD_long$NLCD<=24, "Developed",
+ifelse(NLCD_long$NLCD==31, "Barren",
+ifelse(NLCD_long$NLCD>=41 & NLCD_long$NLCD<=43, "Forest",
+ifelse(NLCD_long$NLCD>=51 & NLCD_long$NLCD<=52, "Shrubland",
+ifelse(NLCD_long$NLCD>=71 & NLCD_long$NLCD<=74, "Herbaceous",
+ifelse(NLCD_long$NLCD>=81 & NLCD_long$NLCD<=82, "Cultivated",
+ifelse(NLCD_long$NLCD>=90 & NLCD_long$NLCD<=95, "Wetlands",
+-9999))))))))
+
+NLCD_ls <- NLCD_long[,c(1, 4, 3)] %>% 
+  group_by(kmeans8, landcover)
+NLCD_ls$kmeans8<-as.factor(NLCD_ls$kmeans8) 
+NLCD_df<-data.frame(NLCD_ls)
+NLCD_df_1<-NLCD_df[order(NLCD_df$kmeans8, NLCD_df$landcover),]
+NLCD_df_2<-NLCD_df_1[NLCD_df_1$landcover!="-9999",]
+NLCD_df_3<-aggregate(NLCD_df_2[,3], by=list(NLCD_df_2$landcover, NLCD_df_2$kmeans8), FUN=sum)
+NLCD_df_4<-NLCD_df_3[,c(2, 1, 3)]
+
+# write.csv(NLCD_df_4, "Results/NLCD_table.csv")
+
+
+
+# combine ign, landcover, climate in table
+
+nrow(ign_table) #24, or 3 per pyrome, so add 17 blank to each pyrome
+NLCD_table<-NLCD_df_4
+nrow(NLCD_df_4) #64, or 8 per pyrome, so add 12 blank to each pyrome
+clim_table<-clim_df_2[complete.cases(clim_df_2), ]
+nrow(clim_table) #160, or 20 per pyrome
+
+
+pyrome_col_1<-c(paste0("Pyrome 1"), rep("", 19),
+  paste0("Pyrome 2"), rep(" ", 19),
+  paste0("Pyrome 3"), rep(" ", 19),
+  paste0("Pyrome 4"), rep(" ", 19),
+  paste0("Pyrome 5"), rep(" ", 19),
+  paste0("Pyrome 6"), rep(" ", 19),
+  paste0("Pyrome 7"), rep(" ", 19),
+  paste0("Pyrome 8"), rep(" ", 19))
+clim_table[,c(2,3)]
+
+blank_NLCD<- data.frame(matrix(ncol = 2, nrow = 12))
+colnames(blank_NLCD) <- names(NLCD_table[,c(2,3)])
+NLCD_col<-rbind(NLCD_table[1:8,c(2,3)], blank_NLCD,
+                NLCD_table[9:16,c(2,3)], blank_NLCD,
+                NLCD_table[17:24,c(2,3)], blank_NLCD,
+                NLCD_table[25:32,c(2,3)], blank_NLCD,
+                NLCD_table[33:40,c(2,3)], blank_NLCD,
+                NLCD_table[41:48,c(2,3)], blank_NLCD,
+                NLCD_table[49:56,c(2,3)], blank_NLCD,
+                NLCD_table[57:64,c(2,3)], blank_NLCD)
+
+blank_ign<- data.frame(matrix(ncol = 2, nrow = 17))
+colnames(blank_ign) <- names(ign_table[,c(2,3)])
+ign_col<-rbind(ign_table[1:3,c(2,3)], blank_ign,
+                ign_table[4:6,c(2,3)], blank_ign,
+                ign_table[7:9,c(2,3)], blank_ign,
+                ign_table[10:12,c(2,3)], blank_ign,
+                ign_table[13:15,c(2,3)], blank_ign,
+                ign_table[16:18,c(2,3)], blank_ign,
+                ign_table[19:21,c(2,3)], blank_ign,
+                ign_table[22:24,c(2,3)], blank_ign)
+  
+ign_NLCD_clim_table<-cbind(pyrome_col_1, ign_col, NLCD_col, clim_table[,c(2,3)])
+names(ign_NLCD_clim_table)<-c ("Pyrome", "Ignition source", "Percent", "Landcover", "Percent", "Climate Zone", "Percent")
+rownames(ign_NLCD_clim_table) <- NULL
+
+
+table_ign_NLCD_clim<-ign_NLCD_clim_table %>% 
+  knitr::kable(
+    format = "latex",
+    align = "l",
+    digits = 2,
+    booktabs = TRUE,
+    longtable = TRUE,
+    caption="Table S4. Controls of each pyrome. Percent of each of the seven pyromes across the contiguous United States occupied by each of the primary controls of fire: vegetation (2016 National Landcover Database (NLCD)), climate (temperature- and moisture-based climate zones (Koppen-Geiger Climate classification)), and ignitions (FPA-FOD). A grid cell is considered dominated by anthropogenic or lightning ignitions if over 75 perecent of ignitions in that grid cell are human or lightning-caused, respectively.",
+    escape = FALSE
+    ) %>%
+  kableExtra::kable_styling(
+      position = "left",
+      latex_options = c("striped", "repeat_header"),
+      stripe_color = "gray!15"
+    )
+
+## Landfire
+FRG_long<-gather(FRG_sum_kmeans8_percent[,c(-(length(names(FRG_sum_kmeans8_percent))))], key = FRG, value=percent, -kmeans8)
+
+FRG_long$fire_regime<-ifelse(FRG_long$FRG==1, "Fire Regime Group I", 
+ifelse(FRG_long$FRG==2, "Fire Regime Group II", 
+ifelse(FRG_long$FRG==3, "Fire Regime Group III", 
+ifelse(FRG_long$FRG==4, "Fire Regime Group IV", 
+ifelse(FRG_long$FRG==5, "Fire Regime Group V", 
+ifelse(FRG_long$FRG==111 | FRG_long$FRG==112, "Water, Snow, or Ice", 
+ifelse(FRG_long$FRG==131 | FRG_long$FRG==132, "Barren or Sparsely Vegetated", 
+ifelse(FRG_long$FRG==133, "Indeterminate Fire Regime Characteristics", 
+-9999))))))))
+
+Landfire_ls <- FRG_long[,c(1, 4, 3)] %>% 
+  group_by(kmeans8, fire_regime)
+Landfire_ls$kmeans8<-as.factor(Landfire_ls$kmeans8)  
+Landfire_df<-data.frame(Landfire_ls)
+Landfire_df_1<-Landfire_df[order(Landfire_df$kmeans8, Landfire_df$fire_regime),]
+Landfire_df_2<-Landfire_df_1[Landfire_df_1$fire_regime!="-9999",]
+Landfire_df_3<-aggregate(Landfire_df_2[,3], by=list(Landfire_df_2$fire_regime, Landfire_df_2$kmeans8), FUN=sum)
+Landfire_df_4<-Landfire_df_3[,c(2, 1, 3)]
+names(Landfire_df_4)<-c("kmeans8", "fire_regime", "percent")
+#write.csv(Landfire_df_4, "Results/Landfire_table.csv")
+
+
+## Ecoregion
+library(tidyr)
+samples_df_k$ecoregion<-as.factor(samples_df_k$ecoregion)
+ecoregion_ls <- samples_df_k %>% 
+  group_by(kmeans8, ecoregion, .drop=FALSE) %>%
+  dplyr::summarise(n=n()) %>% 
+  group_by(kmeans8) %>% 
+  mutate(perc=100*n/sum(n))
+ecoregion_ls$kmeans8<-as.factor(ecoregion_ls$kmeans8
+                                )  
+ecoregion_df<-data.frame(ecoregion_ls)
+ecoregion_table<-ecoregion_df[,c(1,2,4)]
+ecoregion_table[,3]<-round(ecoregion_table[,3],1)
+ecoregion_table_1<-ecoregion_table[ecoregion_table$ecoregion!="0",]
+# write.csv(ecoregion_table, "Results/ecoregion_table.csv")
+
+fig_ecoregion<-ggplot(na.omit(ecoregion_df), aes(x=kmeans8, y=perc, fill=ecoregion, width=.5)) +
+theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  geom_bar(stat="identity", position="dodge") +
+labs(y = "Percent", x="Pyrome", fill="Ecoregion")
+
+# combine FRG and ecoregion in table
+length(unique(ecoregion_table_1$ecoregion))*8==nrow(ecoregion_table_1)
+# 11 unique
+length(unique(Landfire_df_4$fire_regime))*8== nrow(Landfire_df_4)
+# 8 unique (so add 2 bland rows per pyroms)
+
+pyrome_col<-c(paste0("Pyrome 1"), rep("", 10),
+  paste0("Pyrome 2"), rep(" ", 10),
+  paste0("Pyrome 3"), rep(" ", 10),
+  paste0("Pyrome 4"), rep(" ", 10),
+  paste0("Pyrome 5"), rep(" ", 10),
+  paste0("Pyrome 6"), rep(" ", 10),
+  paste0("Pyrome 7"), rep(" ", 10),
+  paste0("Pyrome 8"), rep(" ", 10))
+ecoregion_table_1[,c(2,3)]
+
+blank_Landfire<- data.frame(matrix(ncol = 2, nrow = 3))
+colnames(blank_Landfire) <- names(Landfire_df_4[,c(2,3)])
+Landfire_col<-rbind(Landfire_df_4[1:8,c(2,3)], blank_Landfire,
+                Landfire_df_4[9:16,c(2,3)], blank_Landfire,
+                Landfire_df_4[17:24,c(2,3)], blank_Landfire,
+                Landfire_df_4[25:32,c(2,3)], blank_Landfire,
+                Landfire_df_4[33:40,c(2,3)], blank_Landfire,
+                Landfire_df_4[41:48,c(2,3)], blank_Landfire,
+                Landfire_df_4[49:56,c(2,3)], blank_Landfire,
+                Landfire_df_4[57:64,c(2,3)], blank_Landfire)
+
+FRG_ecoregion_table<-cbind(pyrome_col, Landfire_col, ecoregion_table_1[,c(2,3)])
+names(FRG_ecoregion_table)<-c ("Pyrome", "Fire Regime Group", "Percent", "Ecoregion", "Percent")
+rownames(FRG_ecoregion_table) <- NULL
+
+table_FRG_ecoregion<-FRG_ecoregion_table %>% 
+  knitr::kable(
+    format = "latex",
+    align = "l",
+    digits = 2,
+    booktabs = TRUE,
+    longtable = TRUE,
+    caption="Table S5. Ecosystem type and historical fire regime of each pyrome. Percent of each of the seven pyromes across the contiguous United States occupied by current ecosystem (EPA Level I Ecoregions) and historical fire regime (Landfire FRG). FRG Group I: less than or equal to 35 Year Fire Return Interval, Low and Mixed Severity; FRG Group II: less than or equal to  35 Year Fire Return Interval, Replacement Severity; FRG Group III: 35-200 Year Fire Return Interval, Low and Mixed Severity; FRG Group IV: 35-200 Year Fire Return Interval, Replacement Severity; FRG Group V: greater than 200 Year Fire Return Interval, Any Severity.",
+    escape = FALSE
+    ) %>%
+  kableExtra::kable_styling(
+      position = "left",
+      latex_options = c("striped", "repeat_header"),
+      stripe_color = "gray!15"
+    )
+
+# scratch
+#  theme(legend.title = element_text(size = 3), 
+#               legend.text = element_text(size = 3))+
+#  guides(color = guide_legend(override.aes = list(size = 0.5)))+
+#  guides(shape = guide_legend(override.aes = list(size = 0.5)))
+# theme(legend.position=c(.1,.9))
+
+# clim_df4<-clim_df3[order(clim_df3$kmeans8, clim_df3$climate2),]
+# clim_df5<-aggregate(clim_df4[,3], by=list(clim_df4$climate2, clim_df4$kmeans8), FUN=sum)
+
+
+Fig2a<-
+  ggplot(na.omit(NLCD_table), aes(x=Group.2, y=x, fill=Group.1, width=.9)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  geom_bar(stat="identity", position="dodge")+
+  labs(y = "Percent", x="Pyrome",  fill="NLCD Landcover Type")+
+  theme(legend.title = element_text(size = 7), 
+               legend.text = element_text(size = 7))+
+  guides(color = guide_legend(override.aes = list(size = 0.7)))+
+  guides(shape = guide_legend(override.aes = list(size = 0.7)))
+
+Fig2b<-ggplot(na.omit(clim_df3), aes(x=kmeans8, y=percent, fill=climate2, width=.9)) +
+theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  geom_bar(stat="identity", position="dodge") +
+labs(y = "Percent", x="Pyrome", fill="Climate Zone")+
+  theme(legend.title = element_text(size = 7), 
+               legend.text = element_text(size = 7))+
+  guides(color = guide_legend(override.aes = list(size = 0.7)))+
+  guides(shape = guide_legend(override.aes = list(size = 0.7)))
+
+Fig2c<-ggplot(na.omit(ign_table), aes(x=kmeans8, y=perc, fill=anthro_fac, width=.9)) +
+theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  geom_bar(stat="identity", position="dodge") +
+labs(y = "Percent", x="Pyrome", fill="Ignition Type")+
+  theme(legend.title = element_text(size = 7), 
+               legend.text = element_text(size = 7))+
+  guides(color = guide_legend(override.aes = list(size = 0.7)))+
+  guides(shape = guide_legend(override.aes = list(size = 0.7)))
+
+Landfire_df_5<-Landfire_df_4
+Landfire_df_5$fire_regime2<-ifelse(Landfire_df_4$fire_regime=="Indeterminate Fire Regime Characteristics" | Landfire_df_4$fire_regime=="Water, Snow, or Ice" | Landfire_df_4$fire_regime=="Barren or Sparsely Vegetated", "Non-burnable or Indeterminate",Landfire_df_4$fire_regime)
+Fig2d<-ggplot(na.omit(Landfire_df_5), aes(x=kmeans8, y=percent, fill=fire_regime2, width=.9)) +
+theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  geom_bar(stat="identity", position="dodge") +
+labs(y = "Percent", x="Pyrome", fill="Landfire Historical Fire Regime")+
+  theme(legend.title = element_text(size = 7), 
+               legend.text = element_text(size = 7))+
+  guides(color = guide_legend(override.aes = list(size = 0.7)))+
+  guides(shape = guide_legend(override.aes = list(size = 0.7)))
+
+Fig2<-ggarrange(Fig2a, Fig2b,Fig2c,Fig2d, nrow=2, ncol=2,
+ labels = c("(a)","(b)","(c)","(d)"), label.x =0, hjust = 0)
+ggsave("Figures/Fig2.png", height = 6, width=10)
+
+```
+# Stats for paper
+mean(samples_df_k[(samples_df_k$kmeans8=="3" | samples_df_k$kmeans8=="4" | samples_df_k$kmeans8=="8"),]$Perc_human_FOD_mean)
+# mean(ign_table[((ign_table$kmeans8=="3" | ign_table$kmeans8=="4" | ign_table$kmeans8=="8") & (ign_table$anthro_fac=="Anthro")),]$perc)
+
+mean(samples_df_k[samples_df_k$kmeans8=="1" | samples_df_k$kmeans8=="5" | samples_df_k$kmeans8=="6" | samples_df_k$kmeans8=="7",]$Perc_human_FOD_mean)
+mean(samples_df_k[samples_df_k$kmeans8=="1" | samples_df_k$kmeans8=="5" | samples_df_k$kmeans8=="6" | samples_df_k$kmeans8=="7",]$Mean_area_FOD_mean)
+mean(samples_df_k[samples_df_k$kmeans8=="1" | samples_df_k$kmeans8=="5" | samples_df_k$kmeans8=="6" | samples_df_k$kmeans8=="7",]$Mean_FRP_MODIS_mean)
+# mean(ign_table[((ign_table$kmeans8=="1" | ign_table$kmeans8=="5" | ign_table$kmeans8=="6"| ign_table$kmeans8=="7") & (ign_table$anthro_fac=="Anthro")),]$perc)
+
+# distribution of cropland pixels in each pyrome, or 'cultivated'
+((sum(NLCD_sum_kmeans8[,14])+ sum(NLCD_sum_kmeans8[,15]))/sum(NLCD_sum_kmeans8[,19]))*100
+
+(((NLCD_sum_kmeans8[,14]+ NLCD_sum_kmeans8[,15])/(sum(NLCD_sum_kmeans8[,14]+ NLCD_sum_kmeans8[,15])))*100)
+
+# means versus median
+means_char<-vector()
+for (i in 1:15){
+means_char[i]<-round(mean(samples_df_k[,i]), 2)
+}
+medians_char<-vector()
+for (i in 1:15){
+medians_char[i]<-round(median(samples_df_k[,i]), 2)
+}
+means_medians_char<-data.frame(rbind(means_char, medians_char))
+names(means_medians_char)<-names_vector
+means_medians_char1<-t(means_medians_char)
+# write.csv(means_medians_char1, "Results/means_medians_char.csv")
+
+
+`\newpage{}`{=latex}
+\pagenumbering{arabic}
+\setcounter{page}{16},
+
+
+```{r SITableS1}
+table_eig
+```
+
+```{r SITableS2}
+table_PCAcorr
+```
+
+\newpage
+\begin{landscape}
+
+```{r SITableS3}
+table_fire_char8
+```
+
+
+```{r SITableS4}
+table_ign_NLCD_clim
+```
+
+```{r SITableS5}
+table_FRG_ecoregion
+```
+\end{landscape}
