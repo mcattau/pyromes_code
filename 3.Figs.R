@@ -78,21 +78,8 @@ samples_df_k<-read.csv("Results/samples_df_k.csv")
 samples_df_k<-samples_df_k[,-1]  
  
  
- 
-################ TESTING BELOW  ################
-p1<- ggplot() +
-  geom_tile(data = pyromes, aes(x=east, y=north, fill = as.factor(kmns7))) +
-  geom_sf(data=ecoregions, fill="transparent", color = "black",lwd=0.5)+
-  scale_fill_manual(name="Pyrome",values=c(colorblind_pal()(8)))+
-  theme_void()
-pdf(file = "/Users/megancattau/Dropbox/0_EarthLab/US_Pyromes/Pyromes/pyromes_code/Data/Figures/p1.pdf", height=6, width=8)	
-ggarrange(p1,
-ncol=1, nrow=1)
-dev.off()
-################################################
 
- 
- local_max_dunn<-c( 2,  5,  8, 14, 19, 24, 28, 30, 32, 35, 37, 39)
+local_max_dunn<-c( 2,  5,  8, 14, 19, 24, 28, 30, 32, 35, 37, 39)
 
 make_map_kmeans<-function(kmeans_number, let){
 	ggplot(samples_df_k, aes(x, y)) + 
@@ -175,7 +162,7 @@ MODIS_FRP_dens <-
   scale_x_continuous(trans = "sqrt",
                      breaks = c(10,50,100,200, 300, 400),
                      labels = scales::label_number_si())+
-  ylab("Density") +
+  ylab("Density     ") +
   scale_color_manual(values=c(colorblind_pal()(8)[c(1:6,8)]))+
   theme(legend.position = "none",
         axis.text.y=element_blank(),
@@ -193,7 +180,7 @@ FOD_mean_area_dens <-
                      breaks = c(10,100,1000,3000, 5000, 10000, 20000),
                      labels = scales::label_number_si())+
   xlab("Average Fire Size (ha)\n Transformation: Cube Root") +
-  ylab("Density")+
+  ylab("Density     ")+
   scale_color_manual(values=c(colorblind_pal()(8)[c(1:6,8)]))+
   theme(legend.position = "none",
         axis.text.y=element_blank(),
@@ -207,7 +194,7 @@ ggplot(samples_df_k[samples_df_k$kmeans8!="7",], aes(x=Number_fires_FOD_mean, co
                      breaks=c(10,30,100,200,400),
                      labels = scales::label_number_si())+
   xlab("Fire Frequency (n fires)\n Transformation: Log + 1") +
-  ylab("Density")+
+  ylab("Density     ")+
   scale_color_manual(values=c(colorblind_pal()(8)[c(1:6,8)]))+
   theme(legend.position = "none",
         axis.text.y=element_blank(),
@@ -216,7 +203,7 @@ ggplot(samples_df_k[samples_df_k$kmeans8!="7",], aes(x=Number_fires_FOD_mean, co
 FOD_mean_sl_dens<-          
 ggplot(samples_df_k[samples_df_k$kmeans8!="7",], aes(x=Std_JD_FOD_mean, color = as.factor(kmeans8))) +
   geom_density() +
-  ylab("Density")+
+  ylab("Density     ")+
   xlab("Season Length (days)\n Transformation: Identity")+
   theme_bw() +
   # scale_color_colorblind() +
@@ -233,13 +220,14 @@ FOD_sum_area_dens<-
   scale_x_continuous(trans=cuberoot_trans,
                      breaks= c(10, 100,1000, 5000,10000,15000),
                      labels = scales::label_number_si())+
-  ylab("Density") +
+  ylab("Density     ") +
   scale_color_manual(values=c(colorblind_pal()(8)[c(1:6,8)]))+
   theme(legend.position = "none",
         axis.text.y=element_blank(),
         axis.ticks.y=element_blank())
 
 
+grouped_list<-list.load("Results/grouped_list.rds")
 
 grouped_list_no7<-list(length=15)
 for (i in 1:15){
@@ -257,6 +245,34 @@ make_gg_time8<-function(char){
 	theme(legend.position = "none")
 }		
 
+make_gg_time8_e<-function(char){
+	ggplot(data = grouped_list_no7[[char]], aes(x = year, y = value_by_group)) +
+	geom_point(aes(color = factor(kmeans8))) +
+	# ylim(ylim1, ylim2)+
+	geom_smooth(method="lm", aes(group = kmeans8, color = factor(kmeans8)))+
+	scale_color_manual(values=c(colorblind_pal()(8)[c(1:6,8)]))+
+	  scale_y_continuous(trans = cuberoot_trans,
+                     breaks = c(10,100,1000,3000, 5000, 10000, 20000),
+                     labels = scales::label_number_si())+
+	labs(x="Year", y=paste0(units_simple[char], "\n (Cube Root)"), colour="Pyrome")+
+	theme_bw()+
+	theme(legend.position = "none")
+}
+
+make_gg_time8_k<-function(char){
+	ggplot(data = grouped_list_no7[[char]], aes(x = year, y = value_by_group)) +
+	geom_point(aes(color = factor(kmeans8))) +
+	# ylim(ylim1, ylim2)+
+	geom_smooth(method="lm", aes(group = kmeans8, color = factor(kmeans8)))+
+	scale_color_manual(values=c(colorblind_pal()(8)[c(1:6,8)]))+
+	  scale_y_continuous(trans = cuberoot_trans,
+                     breaks= c(10, 100,1000, 5000,10000,15000),
+                     labels = scales::label_number_si())+
+	labs(x="Year", y=paste0(units_simple[char], "\n (Cube Root)"), colour="Pyrome")+
+	theme_bw()+
+	theme(legend.position = "none")
+}
+
 # Figure 1
 
 dens <- ggarrange(MODIS_FRP_dens, FOD_mean_area_dens,  FOD_mean_freq_dens, FOD_mean_sl_dens, FOD_sum_area_dens, 
@@ -264,10 +280,10 @@ ncol =1, labels = c("(b)","(d)","(f)","(h)","(j)"),label.x =0, hjust = 0)
 
 trends <- ggarrange(
 make_gg_time8(4), 
-make_gg_time8(8), 
+make_gg_time8_e(8), 
 make_gg_time8(3), 
 make_gg_time8(14), 
-make_gg_time8(11), ncol =1, labels = c("(c)","(e)","(g)","(i)","(k)"),label.x =0, hjust = 0)
+make_gg_time8_k(11), ncol =1, labels = c("(c)","(e)","(g)","(i)","(k)"),label.x =0, hjust = 0)
 
 fig1 <- ggdraw(xlim = c(0,7.5), ylim = c(0,10)) +
   draw_plot(k8, x=0, y=7, height = 3, width = 7.5) +
@@ -395,7 +411,9 @@ ggsave(plot=figS9,"Figures/FigS9.png", height = 10, width = 7.5)
 
 # Fig 3 - Niche Trade-offs
 
+
 #just include values >0 for variable 1
+unicode_minus = function(x) sub('^-', '\U2212', format(x))
 make_nich_fig<-function(data, variable1, variable2, SIlabel){
 	gg1 <- merge(data, aggregate(cbind(mean.x=log(data[ ,variable1]), mean.y=log(data[ , variable2]))~kmeans8, data[ , ], mean, na.action=na.omit), by="kmeans8")
 	gg <- merge(gg1, aggregate(cbind(se.x=log(data[ ,variable1]), se.y=log(data[ ,variable2]))~kmeans8, data[ , ], sd, na.action=na.omit), by="kmeans8")
@@ -407,7 +425,10 @@ make_nich_fig<-function(data, variable1, variable2, SIlabel){
 	geom_errorbar(data=gg, width=0, alpha = .2, aes(x=mean.x, ymin=mean.y-se.y,ymax=mean.y+se.y, color=factor(kmeans8)), inherit.aes = FALSE)+
 	scale_color_manual(values=c(colorblind_pal()(8)))+
 	geom_errorbarh(data=gg, height=0, alpha = .2, aes(y=mean.y, xmin=mean.x-se.x,xmax=mean.x+se.x, color=factor(kmeans8)),  inherit.aes = FALSE)+
-	theme_bw()
+	theme_bw()+
+	scale_x_continuous(labels = unicode_minus) + 
+	scale_y_continuous(labels = unicode_minus)
+
 }
 
 
